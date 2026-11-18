@@ -1,0 +1,80 @@
+# =============================================================================
+# OBSIDIA BRODY CONVERGENCE V1 — OFFICIAL GITIGNORE
+# =============================================================================
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Credentials, Environment and Private Configs (CRITICAL)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.token
+credentials.json
+
+# Large Binary & Database Files (CRITICAL: GitHub 100MB limit & LEXICON_PUBLICATION_HOLD)
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+data/linguistic_corpus/lexicon.db
+*.bin
+*.pt
+*.onnx
+*.safetensors
+*.gguf
+_external_sources/
+
+# Runtime Logs, Local Audits, Freezes
+audit_logs/
+logs/
+*.jsonl
+.local_audits/
+_freezes/
+_source_packs/
+_tmp_core_import/
+
+# Private Conversational Memory & Storage
+memory/storage/
+*.chroma/
+*.lance/
+
+# IDE & OS Cache
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
