@@ -46,8 +46,9 @@ def run_reasoning_pipeline(
     memory_index_path: Optional[Any] = None,
     custom_premises: Optional[list[dict[str, Any]]] = None,
     candidate_claims: Optional[list[dict[str, Any]]] = None,
+    editorial_version: str = "V2",
 ) -> ReasoningResult:
-    """Exécute le cycle complet de raisonnement déterministe Brody."""
+    """Exécute le cycle complet de raisonnement déterministe et composition Brody."""
     raw_query = str(query or "").strip()
 
     # 1. Vérification calcul arithmétique exact en priorité
@@ -55,13 +56,44 @@ def run_reasoning_pipeline(
     if arith_expr:
         return solve_arithmetic_query(raw_query)
 
-    # 2. Analyse linguistique native (Lot 2)
+    # 2. Vérification intention éditoriale Studio E11 (Lot 5)
+    from brody.composition import (
+        recognize_native_editorial_request,
+        compose_native_editorial,
+        build_governed_e11_envelope,
+        consume_envelope,
+    )
+    editorial_intent = recognize_native_editorial_request(raw_query)
+    if editorial_intent:
+        comp_res = compose_native_editorial(raw_query, version=editorial_version)
+        if comp_res.get("editorial_route_status") == "CONSULTATIVE_DRAFT_AVAILABLE":
+            draft_text = comp_res.get("editorial_artifact", {}).get("draft", {}).get("text", "")
+            env = build_governed_e11_envelope(raw_query, comp_res)
+            consumed = consume_envelope(env, experiment_id=f"exp_{hashlib.md5(raw_query.encode()).hexdigest()[:8]}")
+            proof_hash = hashlib.sha256(f"EDITORIAL_COMPOSITION:{raw_query}:{editorial_version}".encode("utf-8")).hexdigest()
+            return ReasoningResult(
+                reasoning_type="EDITORIAL_COMPOSITION",
+                status="SUCCESS",
+                query=raw_query,
+                result_text=draft_text,
+                structured_payload={
+                    "composition": comp_res,
+                    "e11_envelope": env,
+                    "e11_consumption": consumed,
+                },
+                premises_count=len(comp_res.get("editorial_composition_snapshot", {}).get("selected_propositions", [])),
+                conclusions_count=len(comp_res.get("editorial_composition_snapshot", {}).get("editorial_plan", [])),
+                proof_hash=proof_hash,
+                restitution_ready=True,
+            )
+
+    # 3. Analyse linguistique native (Lot 2)
     frame = parse_utterance(raw_query, language=language)
 
-    # 3. Construction IR & Trame SENS (Lot 2 / Lot 3)
+    # 4. Construction IR & Trame SENS (Lot 2 / Lot 3)
     sens_entries = sens_state_entries(raw_query, language=language)
 
-    # 4. Consultation de la mémoire native (Lot 3)
+    # 5. Consultation de la mémoire native (Lot 3)
     snapshot = build_native_memory_retrieval_snapshot(
         raw_query,
         memory_required=True,

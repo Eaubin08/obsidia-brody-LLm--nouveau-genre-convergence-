@@ -31,6 +31,7 @@ import os
 from brody.core.paths import BRODY_ROOT
 
 _REPO_ROOT = BRODY_ROOT
+_DESKTOP_ROOT = Path.home() / "Desktop"
 
 
 def get_native_memory_index_path() -> Path:

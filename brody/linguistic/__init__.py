@@ -42,6 +42,7 @@ from brody.linguistic.primitives import (
 )
 from brody.linguistic.french_grammar import (
     parse_utterance,
+    project_editorial_brief,
 )
 from brody.linguistic.english_grammar import (
     parse_english_utterance,
@@ -81,6 +82,7 @@ sys.modules.setdefault("brody.linguistic.freedict_phonetics", freedict_phonetics
 
 __all__ = [
     "parse_utterance",
+    "project_editorial_brief",
     "parse_english_utterance",
     "lookup_surface_form",
     "realize_inflection",
