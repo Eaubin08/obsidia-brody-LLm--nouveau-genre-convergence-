@@ -1,0 +1,21 @@
+{
+  "schema": "BRODY_PRE_REASONING_LEXICAL_CORPUS_PIN_V1",
+  "database_path": "data/linguistic_corpus/lexicon.db",
+  "database_sha256": "a9583d24334169b518521394efb72f1524267b5b4a79c17fb27ce67cd38e04dd",
+  "database_bytes": 555843584,
+  "manifest_sha256": "acf8d833e20e74f10476a47836e6517e26d3cc5db25ab57a0f7e49e229988bc1",
+  "ingestion_report_sha256": "98972d3ba350937b2647e05b4717f6a08d505b4e857f3a936acab7b984acb38d",
+  "source_repository": "Eaubin08/obsidia-x108-proofs",
+  "source_commit": "d4e93f994155a9bec26cc53c6ea5dc9a781bd71a",
+  "reused_function": "periphery.language.lexical_corpus.is_known_lexical_item",
+  "source_blob": "72b991a34fc403f1421f720227db7a1689c10f89",
+  "r6_principle_commits": [
+    "0001f80b282ba4aeaed27769a61e4b24abc5ce3b",
+    "e9f910c609b01f04b07ba0ee67ce28ea1035644e",
+    "63735ba5958fc9097c855b8a7b3b92852188fb46"
+  ],
+  "proof_scope": "LEXICAL_ATTESTATION_ONLY_NOT_SEMANTIC_RESOLUTION_OR_VERIFIED_FACT",
+  "readonly": true,
+  "decision_authority": "KX108_ONLY",
+  "allowed_to_decide": false
+}

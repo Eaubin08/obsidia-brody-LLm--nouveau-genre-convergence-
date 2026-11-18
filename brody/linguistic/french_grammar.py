@@ -1,0 +1,6302 @@
+"""Built-in deterministic grammar: raw utterance -> UtteranceFrame.
+
+Pipeline (each step is scope-aware, none is a phrase dictionary):
+  1. tokenize with character spans aligned on the RAW input;
+  2. remove disfluencies / discourse markers (recorded, never lost);
+  3. segment into clauses at punctuation and connectives (the clause is the
+     scope boundary of negation, modality and pragmatic force);
+  4. build predicate units from verb chains (aux + participle, modal +
+     infinitive, aspectual periphrases);
+  5. assign polarity (ne ... negator, oral negation, sans, EN not),
+     restriction (ne ... que), ne explétif, modality, tense/aspect;
+  6. assign pragmatic / epistemic status from clause role;
+  7. resolve intra-utterance references, relate clauses, derive
+     constraints, contradictions and evidence needs.
+
+French coverage follows docs/semantic/FRENCH_LINGUISTIC_BASIS_V0.md; English
+coverage is deliberately minimal. Deterministic, stdlib-only, no network,
+no model. Describes; never decides.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field, replace
+
+from brody.linguistic.lexicon import fold, has_imperative_paradigm, lookup, predicate_of
+from brody.linguistic.primitives import (
+    Argument, CoordinationRef, LatticeRelation, MannerRef, ObliqueArgumentRef, OperatorScopeRef, ParticipantConfigurationRef,
+    PredicateUnit, RelationKind,
+    UtteranceFrame,
+)
+
+# ── closed word classes ──────────────────────────────────────────────────
+_SUBJECT_PRONOUNS = {
+    "je", "j'", "tu", "il", "elle", "on", "nous", "vous", "ils", "elles",
+    "i", "you", "he", "she", "we", "they",
+}
+_SECOND_PERSON = {"tu", "vous", "you"}
+_FIRST_PERSON = {"je", "j'", "nous", "i", "we"}
+_OBJECT_CLITICS = {"le", "la", "les", "l'", "lui", "leur", "en", "y"}
+_REFLEXIVE_CLITICS = {"me", "m'", "te", "t'", "se", "s'"}
+_DETERMINERS = {
+    "le", "la", "les", "l'", "un", "une", "des", "du", "de", "d'", "au", "aux",
+    "ce", "cet", "cette", "ces", "mon", "ma", "mes", "ton", "ta", "tes",
+    "son", "sa", "ses", "notre", "votre", "nos", "vos", "leur", "leurs",
+    "aucun", "aucune", "the", "an", "this", "these", "those", "that", "my",
+    "your", "some", "any",
+}
+_DEFINITE = {"le", "la", "les", "l'", "the", "au", "aux", "du"}
+_DEMONSTRATIVE_DET = {"ce", "cet", "cette", "ces", "this", "these", "those", "that"}
+_PRONOUN_OBJECTS_EN = {"it", "them"}
+_DEMONSTRATIVE_PRONOUNS = {"ça", "ca", "cela", "ceci", "celui", "celle", "ceux", "celles"}
+_FR_NEGATORS = {"pas", "plus", "jamais", "rien", "personne", "aucun", "aucune",
+                "nul", "nulle", "guère", "guere", "point", "ni"}
+_ORAL_NEGATORS = {"pas", "jamais", "rien"}
+_EN_NEGATORS = {"not", "never", "don't", "doesn't", "didn't", "cannot", "can't",
+                "won't", "shouldn't", "mustn't"}
+_RESTRICTION_ADVERBS = {"only", "seulement", "uniquement"}
+_ADVERBS_SKIPPABLE = {"pas", "jamais", "plus", "rien", "déjà", "deja", "bien",
+                      "surtout", "vraiment", "encore", "toujours", "not", "never",
+                      "please", "stp", "svp", "aussi"}   # aussi: additive adverb, never an object (N6)
+_PREPOSITIONS = {"sur", "dans", "avec", "pour", "à", "a", "en", "par", "vers",
+                 "chez", "on", "in", "with", "to", "for", "into", "at", "of",
+                 "from"}
+# temporal cues carried by UtteranceFrame.deixis / TemporalCueAttachment ("immédiatement": N12-T,
+# relative immediacy; same carrier as "maintenant", not the same meaning)
+_DEIXIS = {"ici", "là", "maintenant", "immédiatement", "immediatement", "aujourd'hui", "demain", "hier",
+           "here", "now", "today", "tomorrow", "yesterday"}
+_TIME_ADVERBS = _DEIXIS | {"dehors", "ensuite", "après", "apres", "avant", "tard", "tôt"}
+# Manner adverbs that must never be read as a bare (determiner-less) object.
+_MANNER_ADVERBS = {"tout", "seul", "seule", "seuls", "vite", "ensemble", "automatiquement",
+                   "directement", "immédiatement", "immediatement", "maintenant",
+                   "rapidement", "lentement", "manuellement", "indirectement", "mieux"}
+_INTERJECTIONS = {"please", "stp", "svp", "merci", "ok", "okay", "bon", "bonjour",
+                  "salut", "hey", "hello", "hi", "oui", "non", "yes", "no"}
+_WH_WORDS = {"comment", "pourquoi", "quand", "où", "quoi", "combien", "how", "what",
+             "why", "when", "where", "whether", "which"}
+_TEMPORAL_INTRODUCERS = {"lorsque", "lorsqu'"}
+_DISFLUENCIES = {"euh", "heu", "bah", "ben", "hum", "hmm", "uh", "um", "erm"}
+_NO_COLLAPSE = {"nous", "vous"}
+_ELIDED_LETTERS = {"l", "j", "n", "m", "t", "s", "d", "c", "qu"}
+
+# Connectives -> normalized connective names.
+_CONNECTIVES = {
+    "mais": "mais", "but": "mais",
+    "puis": "puis", "ensuite": "puis", "then": "puis",
+    "et": "et", "and": "et",
+    "ou": "ou", "or": "ou", "sinon": "ou",
+    "donc": "donc", "so": "donc",
+    "car": "car", "because": "car", "puisque": "car",
+    "alors": "alors",
+    "si": "si", "if": "si",
+    "without": "sans",
+    "before": "avant_de", "after": "apres",
+}
+_CLAUSE_PUNCT = {",", ";", ".", "!", "?", ":"}
+
+_TOKEN_RE = re.compile(r"[^\W\d_]+n't|[^\W_]+'|[^\W_]+|[?!.,;:]", re.UNICODE)
+
+
+@dataclass
+class _Tok:
+    low: str
+    start: int
+    end: int
+    hyphen_before: bool = False
+    analyses: list = field(default_factory=list)
+    accentless_ambiguous: bool = False
+    raw_form: str | None = None  # source case, never a resolved entity identity
+    nominal_subject_evidence: dict | None = None  # local syntactic selection, not identity
+    nominal_object_evidence: dict | None = None  # local corpus-backed object slot, not identity
+
+    @property
+    def is_punct(self) -> bool:
+        return self.low in _CLAUSE_PUNCT
+
+
+@dataclass
+class _Clause:
+    toks: list
+    conn: str | None = None
+    conn_toks: list = field(default_factory=list)
+    restriction: str | None = None      # ONLY | NOT_ONLY
+    restriction_at: int | None = None   # index of "que" in toks
+    embedding_parent: int | None = None  # clause index hosting the embedding verb
+    unresolved_governor: int | None = None  # index of an unknown verb governing "que"
+    governor_lost: bool = False  # "que" clause after a non-nominal word: not a relative
+    coordinated_with: "_Clause | None" = None  # "V que P et que Q": Q's sibling complement P
+    attachment_ambiguous: bool = False  # coordinated after a complement, several attachments open
+    after_postposed_protasis: bool = False  # "R si P et Q": Q in the protasis or the main clause
+    postposed_subordinate: bool = False  # "de sorte que / jusqu'à ce que": G5-R attachment contract
+    main_after_protasis: bool = False  # "R si tu P et exécute Q": morphology leaves only the main reading
+    complement_structure_lost: bool = False  # "V que [le X que P] V2": verbless complement opener merged
+    evidential: str | None = None  # detached source / evidential adverbial ("Selon Marie, P")
+    evidential_span: tuple | None = None  # its raw span (S12: reported when no unit carries it)
+    boundary: str | None = None  # punctuation that opened the clause
+    boundary_tok: object = None  # that punctuation token (kept when a verbless clause is merged back)
+    protasis_head: "_Clause | None" = None  # first "si" clause of a conjunctive protasis
+    ni_head: "_Clause | None" = None  # clause holding "ne" of a verbal "ne ... ni V1 ni V2"
+    compound: tuple | None = None  # (tense, auxiliary surface, draft) of its last AUX+PP predicate
+    shared_aux_host: "_Clause | None" = None  # clause whose auxiliary a bare participle shares
+    modal: object = None  # its last modal+infinitive draft (OBLIGATION), shared by bare infinitives
+    shared_modal_host: "_Clause | None" = None  # clause whose modal a bare infinitive shares
+    prep_member_of: str | None = None   # F-B3G-1: unit id of the prep-governed member it coordinates with
+    rel_member: bool = False            # N7: a verb coordinated inside a subject "qui" relative
+    rel_sibling: "_Clause | None" = None  # N7b: the relative clause it is coordinated with
+    rel_member_possible_request: bool = False  # N7b: homograph under an imperative host (H11 C)
+    main_subject: str | None = None     # R1-R5: the antecedent NP, subject of the main remainder
+    main_subject_members: tuple = ()    # R4: (member token lists, connective) of a coordinated antecedent
+    main_after_relative: bool = False   # R1-R5: main predicate split off after a relative
+    after_rel: "_Clause | None" = None  # R1-R5: the relative clause it follows
+    rel_main_unresolved: bool = False   # R1-R5: subject antecedent whose main predicate was not found
+    ni_modal: object = None  # obligation modal of "ne doit ni INF1 ni INF2" (token, then its draft)
+    ni_scope_open: object = None  # "vouloir" token of a "ne ... ni INF" whose negated scope is not shared
+    neg_scope_open: object = None  # negated operator chain draft whose scope over a bare coordinated INF is open
+    know_how_open: object = None  # savoir (KNOW_HOW) chain draft: its scope over a bare coordinated INF is open
+    wh_governor: object = None  # verb token right before the WH word of a "wh" complement ("sais quand P")
+    subject_unresolved_chain: bool = False  # its bare finite verb disagreed with the host subject (NF4)
+    subject_host: object = None  # its last draft with an explicit subject, shared by an agreeing bare verb
+    shared_subject_host: "_Clause | None" = None  # clause whose subject a bare finite verb shares
+    share_family: str | None = None  # "and" | "or": connective family of a sharing chain member
+    units: list = field(default_factory=list)
+
+
+# ── 1-2. tokenization ────────────────────────────────────────────────────
+def _lower_aligned(raw: str) -> str:
+    out = []
+    for ch in raw:
+        if ch in "’‘ʼ`´":
+            out.append("'")
+            continue
+        low = ch.lower()
+        out.append(low if len(low) == 1 else ch)
+    return "".join(out)
+
+
+def _is_puis_je(t: "_Tok", nxt: "_Tok | None") -> bool:
+    """"puis" inverted with a hyphenated "je" is the first person of pouvoir."""
+    return t.low == "puis" and nxt is not None and nxt.low == "je" and nxt.hyphen_before
+
+
+def _tokenize(raw: str) -> tuple[list[_Tok], list[str], list[str]]:
+    text = _lower_aligned(raw)
+    toks: list[_Tok] = []
+    for m in _TOKEN_RE.finditer(text):
+        hyphen = m.start() > 0 and text[m.start() - 1] == "-"
+        toks.append(_Tok(m.group(), m.start(), m.end(), hyphen, raw_form=raw[m.start():m.end()]))
+
+    ortho: list[str] = []
+    merged: list[_Tok] = []
+    for i, t in enumerate(toks):
+        nxt = toks[i + 1] if i + 1 < len(toks) else None
+        if t.low == "aujourd'" and nxt is not None and nxt.low == "hui":
+            merged.append(t)
+            continue
+        if t.low == "hui" and merged and merged[-1].low == "aujourd'":
+            merged[-1] = _Tok("aujourd'hui", merged[-1].start, t.end, raw_form=raw[merged[-1].start:t.end])
+            continue
+        sentence_start = i == 0 or toks[i - 1].low in {".", "!", "?", ";", ":"}
+        symbolic = raw[t.start:t.end].isupper() and not sentence_start
+        if (t.low in _ELIDED_LETTERS and nxt is not None and not nxt.is_punct
+                and t.low != "a" and nxt.low[:1] in "aeiouyhàâäéèêëîïôöùûü" and not symbolic):
+            # N5: elision only before a vowel / mute h ("j ai", "s il"), and never for an
+            # upper-case letter inside a sentence: "Lance S si P", "Lance D et Q" keep their
+            # symbolic argument (never read as a missing apostrophe)
+            ortho.append(f"missing_apostrophe:{t.low}")
+            t = _Tok(t.low + "'", t.start, t.end, t.hyphen_before, raw_form=t.raw_form)
+        merged.append(t)
+    if merged and merged[0].low == "aujourd'":  # defensive
+        pass
+
+    disfluencies: list[str] = []
+    cleaned: list[_Tok] = []
+    i = 0
+    while i < len(merged):
+        t = merged[i]
+        nxt = merged[i + 1] if i + 1 < len(merged) else None
+        if t.low in _DISFLUENCIES:
+            disfluencies.append(t.low)
+            i += 1
+            continue
+        # "vas-y", "vas y", "allez-y", "go ahead": discourse markers.
+        if t.low in {"vas", "allez", "va"} and nxt is not None and nxt.low == "y":
+            disfluencies.append(f"discourse:{t.low}-y")
+            i += 2
+            continue
+        if t.low == "go" and nxt is not None and nxt.low == "ahead":
+            disfluencies.append("discourse:go-ahead")
+            i += 2
+            continue
+        # Equal spellings across different hyphen boundaries can occupy
+        # different grammatical slots (inversion, compounds, emphasis). They
+        # are source tokens, not licensed oral repetitions to erase.
+        if (cleaned and cleaned[-1].low == t.low and not t.is_punct
+                and cleaned[-1].hyphen_before == t.hyphen_before
+                and t.low not in _NO_COLLAPSE):
+            disfluencies.append(f"repetition:{t.low}")
+            i += 1
+            continue
+        cleaned.append(t)
+        i += 1
+
+    for i, t in enumerate(cleaned):
+        if not t.is_punct:
+            t.analyses, t.accentless_ambiguous = lookup(t.low)
+            if _is_puis_je(t, cleaned[i + 1] if i + 1 < len(cleaned) else None):
+                # "puis-je": pouvoir, present, first person singular (never the connective)
+                t.analyses = [("pouvoir", frozenset({"PRES", "P1S"}))]
+            if t.accentless_ambiguous and any(
+                    "PP" in ft for _, ft in t.analyses) and any(
+                    "PRES" in ft or "INF" in ft for _, ft in t.analyses):
+                ortho.append(f"accentless:{t.low}")
+    ortho.extend(_disambiguate_nominal_context(cleaned))
+    return cleaned, disfluencies, ortho
+
+
+def _bare_nominal_subject_evidence(toks, i, readings):
+    """Qualify a bare nominal slot using the pinned corpus and construction.
+
+    Case alone is insufficient. A following nominal/adjectival homograph keeps
+    the imperative+object alternative open. No person/entity identity is inferred.
+    """
+    from brody.linguistic.lexical_corpus import lookup_surface_form
+    from brody.linguistic.lexical_corpus import corpus_identity
+    tok=toks[i]
+    raw=tok.raw_form or ''
+    boundary=i==0 or toks[i-1].low in {'.','!','?',';',':',',','que',"qu'",'si','quand','lorsque','et','mais'}
+    nouns=[r for r in readings if r.pos in {'noun','NOM','nom'} and r.number=='sg']
+    if (not boundary or tok.hyphen_before or len(raw)<2 or not raw[0].isupper()
+            or not raw[1:].islower() or not nouns):return None
+    j=i+1
+    while j<len(toks) and toks[j].low in (_ADVERBS_SKIPPABLE|_FR_NEGATORS|_OBJECT_CLITICS|_REFLEXIVE_CLITICS|{'ne',"n'"}):j+=1
+    if j>=len(toks) or toks[j].is_punct or not toks[j].analyses:return None
+    rs=lookup_surface_form(toks[j].low,lang='fr')
+    finite=[r for r in rs if r.pos=='verb' and r.mood in {'indicative','subjunctive','conditional'}
+            and r.person=='3' and r.number=='sg']
+    if not finite:return None
+    # Reuse the native auxiliary+participle construction to distinguish a/est
+    # from their nominal homographs; no lexical/causal meaning is manufactured.
+    pp=_next_verb(toks,j+1,_ADVERBS_SKIPPABLE|_FR_NEGATORS|_OBJECT_CLITICS|_REFLEXIVE_CLITICS)
+    auxiliary_chain=(_lemma(toks[j]) in {'avoir','être'} and pp is not None and 'PP' in _feats(toks[pp]))
+    competing=any(r.pos in {'noun','NOM','nom','adjective','adj','ADJ'} for r in rs)
+    identity=corpus_identity()
+    if identity.get('status')!='READY':return None
+    return {'rule':'BARE_CAPITALIZED_NOMINAL_BEFORE_FINITE',
+        'status':'AMBIGUOUS' if competing and not auxiliary_chain else 'SYNTAX_SELECTED',
+        'span':[tok.start,tok.end],'following_finite_span':[toks[j].start,toks[j].end],
+        'noun_evidence':[r.to_dict() for r in nouns],
+        'finite_evidence':[r.to_dict() for r in finite],
+        'following_nominal_or_adjective_alternative':competing,
+        'native_auxiliary_chain':auxiliary_chain,'corpus':identity,
+        'verbal_alternatives':[{'lemma':lemma,'features':sorted(features)} for lemma,features in tok.analyses],
+        'semantic_resolution':False,'verified_fact':False,'entity_identity_verified':False}
+
+
+def _disambiguate_nominal_context(toks):
+    """Corpus-backed nominal reading, before verb and subject consumers.
+
+    Only det + attested adjectives + attested noun; no nominal head may be
+    crossed ("la tâche entreprise" retains its participle). Missing corpus
+    evidence leaves the original analyses intact, never certifies a reading.
+    """
+    from brody.linguistic.lexical_corpus import lookup_surface_form
+    dets = {"un", "une", "des", "du", "cet", "cette", "ces", "chaque"}
+    proof=[]
+    licensed_nominals=set()
+    for i,tok in enumerate(toks):
+        if not tok.analyses:
+            continue
+        try:
+            readings=lookup_surface_form(tok.low,lang="fr")
+            feats=_feats(tok)
+            # Built-in BE/HAVE forms may omit person features; the pinned
+            # corpus supplies finite person/number evidence independently.
+            def finite_rows(value):
+                return [r for r in lookup_surface_form(value.low,lang='fr')
+                        if r.pos=='verb' and r.mood in {'indicative','subjunctive','conditional'}]
+            chain=i+1
+            while chain<len(toks) and toks[chain].low in (_ADVERBS_SKIPPABLE|_FR_NEGATORS|_OBJECT_CLITICS|_REFLEXIVE_CLITICS|{'ne',"n'"}):chain+=1
+            verbal_chain=(chain<len(toks) and (
+                (_MODALITY.get(_pred(tok)) is not None and 'INF' in _feats(toks[chain]))
+                or (_lemma(tok) in {'avoir','être'} and 'PP' in _feats(toks[chain]))))
+            attribute=_bounded_copular_attribute(toks,i)
+            if attribute is not None:
+                for z in range(i+1,attribute+1):
+                    toks[z].analyses=[]
+                    proof.append(('corpus_copular_attribute:' if z==attribute else 'corpus_copular_modifier:')+toks[z].low)
+                continue
+            # Subject pronouns can have participial homographs (tu/TAIRE).
+            # Only the written subject slot + agreeing finite successor
+            # licenses this selection; a real participle remains available.
+            person={'je':('1','sg'),"j'":('1','sg'),'tu':('2','sg'),'il':('3','sg'),
+                    'elle':('3','sg'),'on':('3','sg'),'nous':('1','pl'),'vous':('2','pl'),
+                    'ils':('3','pl'),'elles':('3','pl')}.get(tok.low)
+            boundary=i==0 or toks[i-1].is_punct or toks[i-1].low in {'que',"qu'",'si','quand','lorsque','et','mais'}
+            # Written hyphenated inversion licenses the subject pronoun
+            # from the preceding finite verb's actual person/number. A bare
+            # participle after an auxiliary is not inverted ("Il a tu", or
+            # the second tu in "As-tu tu"); its verb analyses remain intact.
+            if person and tok.hyphen_before and i>0:
+                preceding=finite_rows(toks[i-1])
+                if any((r.person,r.number)==person for r in preceding):
+                    tok.analyses=[];proof.append('corpus_inverted_subject_pronoun:'+tok.low);continue
+            if person and boundary and chain<len(toks):
+                following=finite_rows(toks[chain])
+                if any((r.person,r.number)==person for r in following):
+                    tok.analyses=[];proof.append('corpus_subject_pronoun:'+tok.low);continue
+            if verbal_chain:
+                continue
+            bare_subject=_bare_nominal_subject_evidence(toks,i,readings)
+            if bare_subject is not None:
+                tok.nominal_subject_evidence=bare_subject
+                if bare_subject['status']=='SYNTAX_SELECTED':
+                    tok.analyses=[];licensed_nominals.add(i)
+                    proof.append('corpus_bare_nominal_subject:'+tok.low)
+                    continue
+            # A determined object governed by an already written predicate
+            # cannot be another independent finite predicate merely because
+            # its noun has a verbal homograph. Clitic + finite without such
+            # a governor is deliberately preserved ("je le code").
+            if i and toks[i-1].low in {'le','la','les',"l'"} and 'INF' not in feats:
+                end=i+1
+                while end<len(toks) and not toks[end].is_punct:
+                    rs=lookup_surface_form(toks[end].low,lang='fr')
+                    if toks[end].analyses or not any(r.pos in {'adjective','adj','ADJ'} for r in rs):break
+                    end+=1
+                right_boundary=end==len(toks) or toks[end].is_punct or toks[end].low in _PREPOSITIONS|set(_CONNECTIVES)
+                left=i-2
+                while left>=0 and not toks[left].is_punct and toks[left].low not in set(_CONNECTIVES)|_WH_WORDS|{'que',"qu'"}:left-=1
+                governor=any(_is_verb(toks,j) for j in range(left+1,i-1))
+                if right_boundary and governor and any(r.pos in {'noun','nom','NOM'} for r in readings):
+                    from brody.linguistic.lexical_corpus import corpus_identity
+                    if corpus_identity().get('status')=='READY':
+                        tok.analyses=[];licensed_nominals.add(i);proof.append('corpus_governed_nominal:'+tok.low);continue
+            # A PP-only, corpus-attested adjective can modify a positively
+            # licensed noun; agreement is evidence, never an invented event.
+            if i>=1 and 'PP' in feats and not feats.intersection({'PRES','IMP','INF','FUT','COND','IMPF','SUBJ'}):
+                prev=toks[i-1]
+                prev_readings=lookup_surface_form(prev.low,lang='fr')
+                nouns=[r for r in prev_readings if r.pos in {'noun','NOM','nom'}]
+                adjs=[r for r in readings if r.pos in {'adjective','adj','ADJ'}]
+                licensed=(i-1 in licensed_nominals or (i>=2 and toks[i-2].low in _DETERMINERS and not prev.analyses))
+                agrees=any(n.gender and a.gender and n.number and a.number
+                    and n.gender.casefold()[:1]==a.gender.casefold()[:1]
+                    and n.number.casefold()[:1]==a.number.casefold()[:1] for n in nouns for a in adjs)
+                if licensed and agrees:
+                    tok.analyses=[]
+                    proof.append('corpus_postnominal_adjective:'+tok.low)
+                    continue
+            # Postnominal adjective inside the determined OBJECT of an already
+            # written predicate: the finite homograph has no independent subject
+            # here. Corpus agreement licenses syntax only, never a fact or sense.
+            chain=i+1
+            while chain<len(toks) and toks[chain].low in (_ADVERBS_SKIPPABLE | _FR_NEGATORS | _OBJECT_CLITICS | _REFLEXIVE_CLITICS):
+                chain+=1
+            licensed_verbal_chain = (chain<len(toks) and tok.analyses and (
+                (_MODALITY.get(_pred(tok)) is not None and "INF" in _feats(toks[chain]))
+                or (_lemma(tok) in {"avoir","être"} and "PP" in _feats(toks[chain]))))
+            if i >= 2 and "INF" not in feats and not licensed_verbal_chain:
+                prev = toks[i-1]
+                nouns = [r for r in lookup_surface_form(prev.low, lang="fr") if r.pos in {"noun","NOM","nom"}]
+                adjs = [r for r in readings if r.pos in {"adjective","adj","ADJ"}]
+                det_at = i-2
+                if toks[det_at].low in _DETERMINERS and not prev.analyses and nouns and adjs:
+                    agrees = any(n.number and a.number and n.number == a.number
+                        and (not n.gender or not a.gender or n.gender == a.gender) for n in nouns for a in adjs)
+                    start = det_at-1
+                    while (start >= 0 and not toks[start].is_punct
+                           and toks[start].low not in set(_CONNECTIVES) | _WH_WORDS | _TEMPORAL_INTRODUCERS | {"que","qu'"}):
+                        start -= 1
+                    governed = any(_is_verb(toks, j) for j in range(start+1, det_at))
+                    from brody.linguistic.lexical_corpus import corpus_identity
+                    if agrees and governed and corpus_identity().get("status") == "READY":
+                        tok.analyses=[]
+                        proof.append("corpus_object_adjective:"+tok.low)
+                        continue
+            if not any(r.pos in {"noun", "NOM", "nom"} for r in readings):
+                continue
+            # A corpus-attested noun in FAIRE's direct-complement slot can
+            # have a finite homograph (sens / confiance). This licenses only
+            # the nominal syntax, never the sense of a support construction.
+            left=i-1
+            while left>=0 and toks[left].low in (_ADVERBS_SKIPPABLE | {"ne","n'"})-{"rien"}:left-=1
+            if (left>=0 and _is_verb(toks,left) and _lemma(toks[left])=="faire" and "INF" not in feats):
+                right=i+1
+                while right<len(toks) and not toks[right].is_punct:
+                    if toks[right].low in _PREPOSITIONS | set(_CONNECTIVES):break
+                    rs=lookup_surface_form(toks[right].low,lang="fr")
+                    if toks[right].analyses or not any(r.pos in {"adjective","adj","ADJ"} for r in rs):break
+                    right+=1
+                boundary=(right==len(toks) or toks[right].is_punct or toks[right].low in _PREPOSITIONS | set(_CONNECTIVES))
+                from brody.linguistic.lexical_corpus import corpus_identity
+                if boundary and corpus_identity().get("status")=="READY":
+                    tok.analyses=[];licensed_nominals.add(i)
+                    proof.append("corpus_faire_nominal:"+tok.low)
+                    continue
+            # Determiner + attested agreeing adjective(s) + attested noun +
+            # a following finite predicate form one written subject NP. The
+            # noun's finite homograph is not a second main predicate. Without
+            # that following finite evidence, genuine verbal readings remain.
+            left=i-1
+            prefix_adjectives=[]
+            while left>=0 and toks[left].low not in _DETERMINERS:
+                if toks[left].is_punct or toks[left].analyses:break
+                ars=[r for r in lookup_surface_form(toks[left].low,lang="fr") if r.pos in {"adjective","adj","ADJ"}]
+                if not ars:break
+                prefix_adjectives.append(ars);left-=1
+            subject_dets=_DETERMINERS-{"de","d'","du","des","au","aux"}
+            if (left>=0 and toks[left].low in subject_dets
+                    and (left==0 or toks[left-1].is_punct or toks[left-1].low in {"que","qu'"})):
+                right=i+1
+                while right<len(toks) and not toks[right].analyses and not toks[right].is_punct:
+                    rs=lookup_surface_form(toks[right].low,lang="fr")
+                    if not any(r.pos in {"adjective","adj","ADJ"} for r in rs):break
+                    right+=1
+                finite=(right<len(toks) and _is_verb(toks,right) and (bool(_feats(toks[right]) & {'P3S','P3P'}) or any(r.person=='3' for r in finite_rows(toks[right]))))
+                required='pl' if toks[left].low in {'les','ces','mes','tes','ses','nos','vos','leurs'} else 'sg'
+                noun_rows=[r for r in readings if r.pos in {'noun','NOM','nom'} and r.number==required]
+                agrees=any(all(any(a.number==n.number and (not n.gender or not a.gender or n.gender==a.gender)
+                    for a in ars) for ars in prefix_adjectives) for n in noun_rows)
+                if finite and agrees:
+                    from brody.linguistic.lexical_corpus import corpus_identity
+                    if corpus_identity().get("status")=="READY":
+                        tok.analyses=[];licensed_nominals.add(i)
+                        proof.append('corpus_definite_subject_nominal:'+tok.low)
+                        continue
+            # Partitive noun, not the infinitive governed by de/d'.
+            if (i and toks[i-1].low in {'de',"d'"} and 'INF' not in feats
+                    and tok.raw_form and not tok.raw_form[0].isupper()):
+                tok.analyses=[];licensed_nominals.add(i)
+                proof.append('corpus_partitive_nominal:'+tok.low)
+                continue
+            # Immediate le/la/les may be clitics. Only an attested coordinated
+            # nominal predecessor licenses the nominal reading here.
+            coord_pred = False
+            if i>=3 and toks[i-1].low in {'le','la','les',"l'"} and toks[i-2].low in {'et','ou',','}:
+                p = i - 3
+                saw_noun = False
+                while p >= 0 and (i - 3) - p <= 4:
+                    if toks[p].low in dets | {'le','la','les',"l'"} | (_DETERMINERS - {'de',"d'"}):
+                        coord_pred = saw_noun and p < i - 2
+                        break
+                    if toks[p].is_punct or toks[p].analyses:
+                        break
+                    p_pos = {r.pos for r in lookup_surface_form(toks[p].low, lang='fr')}
+                    if not p_pos.intersection({'noun','NOM','nom','adjective','adj','ADJ'}):
+                        break
+                    if p_pos.intersection({'noun','NOM','nom'}):
+                        saw_noun = True
+                    p -= 1
+            if coord_pred:
+                tok.analyses=[];licensed_nominals.add(i)
+                proof.append('corpus_coordinated_nominal:'+tok.low)
+                continue
+            # A definite determiner cannot be a verbal clitic when it is
+            # immediately governed by a preposition: "à la demande", "de la
+            # consigne". Corpus evidence is mandatory; no topic-based reading.
+            if (i>=2 and toks[i-1].low in {'le','la','les',"l'"}
+                    and toks[i-2].low in _PREPOSITIONS | {'de',"d'"}
+                    and not _is_verb(toks,i-2) and 'INF' not in feats):
+                tok.analyses=[];licensed_nominals.add(i)
+                proof.append('corpus_prep_nominal:'+tok.low)
+                continue
+            j=i-1
+            while j>=0 and i-j<=4:
+                prev=toks[j]
+                if prev.low in dets or (j<i-1 and prev.low in {"le","la","les","l'"}):
+                    tok.analyses=[];licensed_nominals.add(i)
+                    proof.append("corpus_nominal:"+tok.low)
+                    break
+                pos={r.pos for r in lookup_surface_form(prev.low,lang="fr")}
+                # An attested nominal subject must not be traversed to erase
+                # its following finite verb (det + noun + third-person verb).
+                if pos.intersection({'noun','NOM','nom'}) and (feats.intersection({'P3S','P3P'}) or finite_rows(tok)):
+                    break
+                # An attested adjective may also have a nominal reading (petite).
+                # A noun WITHOUT adjective evidence is a head: never cross it.
+                if not pos.intersection({"adjective","adj","ADJ"}):
+                    break
+                j-=1
+        except (OSError, RuntimeError):
+            continue
+    # Reuse the already licensed instrumental construction, but only where
+    # its complete nominal suffix and a unique native host/object are present.
+    # SOURCE/PARTIR remains deliberately untouched: the same spelling may be
+    # an infinitival complement rather than a prepositional source marker.
+    try:
+        from brody.linguistic.lexical_corpus import corpus_identity
+        ready=corpus_identity().get('status')=='READY'
+    except (OSError,RuntimeError):ready=False
+    if ready:
+        for k in range(len(toks)):
+            licensed=next(((head,name,role) for head,name,role in _LICENSED_OBLIQUES
+                           if role=='INSTRUMENT' and
+                           tuple(t.low for t in toks[k:k+len(head)])==head),None)
+            if licensed is None:continue
+            head,name,role=licensed
+            if not any(t.analyses for t in toks[k:k+len(head)]):continue
+            start=max([0]+[j+1 for j,t in enumerate(toks[:k]) if t.is_punct])
+            prefix=toks[start:k]
+            if not prefix:continue
+            drafts=_build_drafts(prefix)
+            if len(drafts)!=1:continue
+            objects=_objects_for(prefix,drafts[0],_Clause(prefix))
+            if not objects or not objects[-1].span or objects[-1].span[1]!=prefix[-1].end:continue
+            end=k+len(head)
+            while end<len(toks) and not toks[end].is_punct:end+=1
+            end-=1
+            if end<k+len(head):continue
+            parsed=_oblique_members(toks,k,end)
+            if parsed is None or parsed[0]!=name or parsed[1]!=role:continue
+            for token in toks[k:k+len(head)]:token.analyses=[]
+            proof.append('licensed_instrument_marker:'+name)
+    return proof
+
+
+# ── helpers on analyses ──────────────────────────────────────────────────
+def _feats(tok: _Tok) -> frozenset:
+    out: set = set()
+    for _, ft in tok.analyses:
+        out |= ft
+    return frozenset(out)
+
+
+def _lemma(tok: _Tok) -> str:
+    # Prefer a French lemma when both a French and an English one exist.
+    fr = [lem for lem, ft in tok.analyses if "EN" not in ft]
+    return (fr or [tok.analyses[0][0]])[0]
+
+
+def _en_only(tok: _Tok) -> bool:
+    return bool(tok.analyses) and all("EN" in ft for _, ft in tok.analyses)
+
+
+def _cls(tok: _Tok) -> str:
+    return predicate_of(_lemma(tok))[1] if tok.analyses else "none"
+
+
+def _pred(tok: _Tok) -> str:
+    return predicate_of(_lemma(tok))[0]
+
+
+_EN_CONTEXT = {"then", "and", "but", "not", "don't", "doesn't", "didn't", "never",
+               "you", "i", "we", "please", "to", "can", "could", "must", "should",
+               "only", "do", "it", "they", "he", "she", "so", "or", "without"}
+
+
+def _is_verb(toks: list[_Tok], i: int) -> bool:
+    t = toks[i]
+    if not t.analyses:
+        return False
+    # A corpus noun/verb homograph may already have been selected in the
+    # direct-object slot by _build_drafts. Keep its lexical analyses for the
+    # structural record, while preventing a second predicate from being made.
+    if t.nominal_object_evidence is not None:
+        return False
+    prev = toks[i - 1] if i > 0 else None
+    # A demonstrative before its finite predicate is a subject, not the
+    # corpus homograph CELER ("que cela fasse"). Real "il cela un secret"
+    # retains its verbal reading; no global closed-word suppression.
+    if t.low in _DEMONSTRATIVE_PRONOUNS and (prev is None or prev.is_punct or prev.low in {"que", "qu'"}):
+        j=i+1
+        while j<len(toks) and toks[j].low in {"ne", "n'"} | _OBJECT_CLITICS:j+=1
+        if j<len(toks) and _feats(toks[j]) & {"PRES", "SUBJ", "IMPF", "FUT", "COND", "PAST_SIMPLE"}:
+            return False
+    # A capitalized non-infinitive after a written preposition may occupy
+    # an NP slot. Preserve it as declared syntax, not a verified person.
+    if (prev is not None and prev.low in _PREPOSITIONS and not prev.analyses
+            and t.raw_form and t.raw_form[0].isupper() and "INF" not in _feats(t)):
+        return False
+    if _en_only(t):
+        return prev is None or prev.low in _EN_CONTEXT
+    if prev is not None and prev.low in _DETERMINERS:
+        # "le lance" / "le lancer": clitic + verb; "le script": det + noun.
+        if prev.low in {"le", "la", "les", "l'"}:
+            return True
+        # "de lancer" (vient de, en train de, besoin de): infinitive.
+        if prev.low in {"de", "d'"} and "INF" in _feats(t):
+            return True
+        return False
+    return True
+
+
+# ── 3. clause segmentation ───────────────────────────────────────────────
+UNRESOLVED_GOVERNOR = "UNKNOWN_COMPLEMENT_GOVERNOR"
+UNRESOLVED_GOVERNOR_CLASS = "unresolved_complement_governor"
+# Epistemic marker of a complement whose known governor has no embedding
+# contract (confirmer, expliquer, savoir... + que): not asserted, not typed.
+UNRESOLVED_GOVERNANCE = "UNRESOLVED_GOVERNANCE"
+
+# Closed-class words that can precede "que" without being a verb
+# (subordinators, comparison / degree adverbs, disjunctive pronouns).
+_NON_GOVERNOR_WORDS = {
+    "ainsi", "bien", "tant", "aussi", "autant", "plutôt", "plutot", "même", "meme",
+    "lors", "dès", "des", "pour", "afin", "tandis", "moins", "plus", "mieux", "pire",
+    "tel", "telle", "tels", "telles", "moi", "toi", "lui", "eux", "ça", "cela", "ceci",
+}
+_PARTICIPLE_ENDINGS = ("é", "ée", "és", "ées", "i", "ie", "is", "ies", "u", "ue", "us", "ues",
+                       "it", "ite", "its", "ites",
+                       # irregular participles: découvert, mort, peint / craint / joint, dû
+                       "ert", "erte", "erts", "ertes", "ort", "orte", "orts", "ortes",
+                       "int", "inte", "ints", "intes", "û", "ûe", "ûs", "ûes")
+_ANTECEDENT_PRONOUNS = {"ce", "c'", "celui", "celle", "ceux", "celles", "cela", "ça", "ca", "tout", "rien"}
+_DEGREE_WORDS = {"si", "tellement", "tant", "trop", "assez", "tel", "telle", "tels", "telles"}
+# Nominal / pronominal complement heads between a governor and "que":
+# "parler du fait que", "tenir à ce que", "parler de ce que".
+_COMPLEMENT_HEADS = {("du", "fait"), ("le", "fait"), ("de", "ce"), ("à", "ce")}
+
+
+def _unresolved_governor_index(toks: list[_Tok]) -> int | None:
+    """Index of a lexicon-unknown verb in verb position right before "que".
+
+    Structural only: the word before "que" (after a "ne ... NEG" frame) has no
+    lexical analysis and follows a subject pronoun, a nominal subject opening
+    the clause, or an avoir/être auxiliary with a participle ending. Relatives
+    (det + noun + que), clefts, restrictions and comparatives are excluded.
+    """
+    lows = [t.low for t in toks]
+    has_ne = any(x in {"ne", "n'"} for x in lows)
+    if has_ne and not any(x in _FR_NEGATORS for x in lows):
+        return None  # "ne V que": restriction, not a complement
+    j = len(toks) - 1
+    if j >= 2 and (lows[j - 1], lows[j]) in _COMPLEMENT_HEADS:
+        j -= 2  # the governor precedes the complement head ("parle du fait que")
+    while has_ne and j >= 0 and lows[j] in _FR_NEGATORS:
+        j -= 1
+    if j < 0:
+        return None
+    g = toks[j]
+    if (g.analyses or g.is_punct or not g.low.isalpha() or g.low in _NON_GOVERNOR_WORDS
+            or g.low in _DETERMINERS or g.low in _SUBJECT_PRONOUNS or g.low in _PREPOSITIONS
+            or g.low in _CONNECTIVES or g.low in _WH_WORDS):
+        return None
+    k = j - 1
+    # Skip "ne", a "ne ... NEG" negator and clitics (se souvient, me doute, te promet).
+    while k >= 0 and (lows[k] in {"ne", "n'"} or lows[k] in _REFLEXIVE_CLITICS
+                      or (has_ne and lows[k] in _FR_NEGATORS)):
+        k -= 1
+    if k < 0:
+        return None
+    before = toks[k]
+    if before.low in _SUBJECT_PRONOUNS:
+        return j
+    if _is_verb(toks, k) and _pred(before) in {"HAVE", "BE"}:
+        cleft = k > 0 and lows[k - 1] in {"c'", "ce"}
+        return j if g.low.endswith(_PARTICIPLE_ENDINGS) and not cleft else None
+    if _is_verb(toks, k) and _cls(before) in {"modal", "aspectual"}:
+        # "pourrait découvrir que", "va découvrir que": unknown infinitive governor.
+        return j if g.low.endswith(_INFINITIVE_ENDINGS) else None
+    if before.analyses or before.low in _DETERMINERS or before.low in _NON_GOVERNOR_WORDS:
+        return None
+    if k == 0 or (k == 1 and lows[0] in _DETERMINERS):
+        return j
+    return None
+
+
+def _clause_follows(toks: list[_Tok], que_at: int) -> bool:
+    """True when a verb occurs after "que" before the next clause punctuation."""
+    k = que_at + 1
+    while k < len(toks) and not toks[k].is_punct:
+        if _is_verb(toks, k):
+            return True
+        k += 1
+    return False
+
+
+def _known_complement_governor(ctoks: list[_Tok], toks: list[_Tok], que_at: int) -> bool:
+    """A lexicon-known verb without embedding contract governing "que + clause".
+
+    Structural only: the clause's last verb is known, is neither an embedding
+    verb nor an auxiliary/copula/volitive, and is followed before "que" only by
+    a "ne ... NEG" negator and/or an "à + NP" indirect object, and a finite
+    clause follows "que". "ne V que" stays a restriction; for governed actions
+    (world_action, preparatory) "ne V pas que" keeps its "not only" reading.
+    """
+    v = next((k for k in range(len(ctoks) - 1, -1, -1) if _is_verb(ctoks, k)), None)
+    if v is None or not ctoks[v].analyses:
+        return False
+    cls, pred = _cls(ctoks[v]), _pred(ctoks[v])
+    if cls.startswith("embedding") or pred in {"HAVE", "BE", "WANT", "NEED"}:
+        return False
+    lows = [t.low for t in ctoks]
+    has_ne = any(x in {"ne", "n'"} for x in lows)
+    if has_ne and not any(x in _FR_NEGATORS for x in lows):
+        return False
+    if has_ne and cls in {"world_action", "preparatory"}:
+        return False
+    k = v + 1
+    while k < len(ctoks) and ctoks[k].hyphen_before and (lows[k] in _SUBJECT_PRONOUNS or lows[k] == "t'"):
+        k += 1   # inverted subject ("sait-elle que", "sait-t-il que"): not a complement tail
+    while has_ne and k < len(ctoks) and lows[k] in _FR_NEGATORS:
+        k += 1
+    tail = lows[k:]
+    # "parle du fait que P", "parle de ce que P": a nominal complement head, as for an unknown
+    # governor (_unresolved_governor_index); never a relative over "le fait"
+    if len(tail) == 2 and tuple(tail) in _COMPLEMENT_HEADS:
+        return _clause_follows(toks, que_at)
+    if tail and not (tail[0] in {"à", "au", "aux"} and len(tail) <= 4
+                     and not any(_is_verb(ctoks, m) for m in range(k, len(ctoks)))):
+        return False
+    return _clause_follows(toks, que_at)
+
+
+def _unresolved_governor_draft(toks: list[_Tok], idx: int) -> "_Draft":
+    k = idx - 1
+    while k >= 0 and toks[k].low in _FR_NEGATORS | {"ne", "n'"}:
+        k -= 1
+    aux = k >= 0 and _is_verb(toks, k) and _pred(toks[k]) in {"HAVE", "BE"}
+    modal = k >= 0 and not aux and _is_verb(toks, k) and _cls(toks[k]) in {"modal", "aspectual"}
+    folded = modal and _pred(toks[k]) == "GO"  # "va découvrir": aller folds into the infinitive
+    head = k if aux or folded else idx  # under a modal unit, negation scope stays on the infinitive
+    subj, person = _subject_before(toks, k if modal else head)
+    if modal:
+        # A modal keeps its own unit and governs this infinitive (see
+        # _mark_governed); "aller + inf" folds into the infinitive as for known
+        # verbs ("va dire" -> NEAR_FUTURE), so the future is never lost.
+        tense = "NEAR_FUTURE" if folded else "NONE"
+        form = "INFINITIVE"
+    elif aux:
+        tense = {"PRESENT": "PAST", "PAST": "PLUPERFECT", "FUTURE": "FUTURE",
+                 "CONDITIONAL": "CONDITIONAL"}.get(_tense_of(_feats(toks[k])), "PAST")
+        form = "PARTICIPLE"
+    else:
+        tense, form = "NONE", "FINITE"
+    return _Draft(toks[idx], idx, head, form, tense, subject=subj, subject_person=person,
+                  unresolved_governor=True)
+
+
+def _last_verb(toks: list[_Tok]) -> _Tok | None:
+    for i in range(len(toks) - 1, -1, -1):
+        if _is_verb(toks, i):
+            return toks[i]
+    return None
+
+
+_ELIDED_SI_SUBJECTS = {"il", "ils", "elle", "elles"}
+
+
+def _politeness_formula(toks: list[_Tok], i: int) -> bool:
+    """ "s'il te plaît" / "s'il vous plaît" is a politeness formula, not a protasis."""
+    return (i + 3 < len(toks) and toks[i + 1].low == "il" and toks[i + 2].low in {"te", "vous"}
+            and toks[i + 3].low in {"plaît", "plait"})
+
+
+def _si_nominal_subject(toks: list[_Tok], i: int) -> bool:
+    """ "si" + bare nominal subject (proper noun, 1-2 words) + verb opens a protasis.
+
+    Structural: the word(s) after "si" are unknown to the lexicon and are not
+    function words, and a verb follows (optionally after "ne"). Adverbial "si"
+    ("si content", "si bien fait") has no verb right after its complement.
+    """
+    blocked = (_NON_GOVERNOR_WORDS | _DETERMINERS | _PREPOSITIONS | _WH_WORDS | _FR_NEGATORS
+               | _SUBJECT_PRONOUNS | {"que", "qu'", "qui", "ne", "n'"})
+    j, names = i + 1, 0
+    while j < len(toks) and names < 2:
+        t = toks[j]
+        if t.is_punct or t.analyses or not t.low.isalpha() or t.low in blocked or t.low in _CONNECTIVES:
+            break
+        names += 1
+        j += 1
+    if names == 0:
+        return False
+    if j < len(toks) and toks[j].low == "et":
+        # "si Nadia et Luc exécutent Q": a coordinated subject, only with a plural verb
+        k = j + 1
+        if k < len(toks) and toks[k].low in _DETERMINERS:
+            k += 1
+        conj = 0
+        while k < len(toks) and conj < 2 and (toks[k].low in _TONIC_PRONOUNS or not (
+                toks[k].is_punct or toks[k].analyses or not toks[k].low.isalpha()
+                or toks[k].low in blocked or toks[k].low in _CONNECTIVES)):
+            conj += 1
+            k += 1
+        while k < len(toks) and toks[k].low in {"ne", "n'"}:
+            k += 1
+        return conj > 0 and k < len(toks) and _is_verb(toks, k) and _plural_verb(toks[k])
+    while j < len(toks) and toks[j].low in {"ne", "n'"}:
+        j += 1
+    return j < len(toks) and _is_verb(toks, j)
+
+
+def _si_unresolved_governor(toks: list[_Tok], i: int) -> bool:
+    """Clause-initial "si" + nominal subject + unknown complement governor + "que".
+
+    "Si Marie découvre que X, ..." / "Si Marie se souvient que X, ...": the
+    governor is unknown to the lexicon, so no verb follows the subject; the
+    protasis is recognised through the same structural governor test as a
+    main clause. Mid-clause adverbial "si" ("est si peu fiable que") is excluded.
+    """
+    if not (i == 0 or toks[i - 1].is_punct or toks[i - 1].low in _CONNECTIVES):
+        return False
+    q = i + 1
+    while q < len(toks) and not toks[q].is_punct and toks[q].low not in {"que", "qu'"}:
+        q += 1
+    if q >= len(toks) or toks[q].low not in {"que", "qu'"} or q - i < 3:
+        return False
+    return _unresolved_governor_index(toks[i + 1:q]) is not None
+
+
+# ── unanalyzed predicative content (M8-0b) ───────────────────────────────
+# A clause whose verb the lexicon does not know yields no PredicateUnit. It is
+# not non-existent: it is reported in frame.missing with its span and link.
+UNANALYZED_PREDICATIVE_CONTENT = "unanalyzed_predicative_content"
+_INFINITIVE_ENDINGS = ("er", "ir", "re", "oir")
+_PRE_VERB_SKIP = {"ne", "n'", "y", "en", "le", "la", "les", "l'", "lui", "leur"} | _REFLEXIVE_CLITICS
+_AUX_ADVERBS = {"déjà", "deja", "bien", "vraiment", "encore", "toujours", "souvent", "enfin", "aussi"}
+# Constructions already analysed without a PredicateUnit ("il paraît que" -> HEARSAY).
+_ANALYSED_NON_UNIT_WORDS = {"paraît", "parait"}
+
+
+def _content_word(t: _Tok) -> bool:
+    """A word unknown to the lexicon that is not a closed-class function word."""
+    return (not t.analyses and not t.is_punct and t.low.isalpha()
+            and t.low not in _NON_GOVERNOR_WORDS | _DETERMINERS | _PREPOSITIONS | _WH_WORDS
+            | _FR_NEGATORS | _SUBJECT_PRONOUNS | set(_CONNECTIVES) | _ANALYSED_NON_UNIT_WORDS
+            | {"que", "qui", "si"})
+
+
+def _lost_verb_evidence(clause: "_Clause") -> list[tuple[int, int]]:
+    """(auxiliary/modal index, unknown participle/infinitive index) pairs of the clause."""
+    toks, lows = clause.toks, [t.low for t in clause.toks]
+    out = []
+    for k in range(len(toks)):
+        if not _is_verb(toks, k) or toks[k].hyphen_before:
+            continue
+        pred, cls = _pred(toks[k]), _cls(toks[k])
+        if pred in {"HAVE", "BE"} or cls in {"modal", "aspectual"}:
+            # After an auxiliary only negators / adverbs can intervene ("n'est
+            # pas parti"); object clitics may follow a modal ("peut le faire").
+            if pred in {"HAVE", "BE"}:
+                skip = _FR_NEGATORS | _AUX_ADVERBS
+            else:
+                skip = _PRE_VERB_SKIP | _FR_NEGATORS | _AUX_ADVERBS
+            j = k + 1
+            while j < len(toks) and lows[j] in skip:
+                j += 1
+            endings = _PARTICIPLE_ENDINGS if pred in {"HAVE", "BE"} else _INFINITIVE_ENDINGS
+            if j < len(toks) and _content_word(toks[j]) and lows[j].endswith(endings):
+                out.append((k, j))
+    return out
+
+
+# connectives whose clause is always expected to carry a predication: a copula +
+# attribute there is reported, never dropped ("Lance P si c'est prêt")
+_COPULA_REPORTED_CONNS = {"si", "que", "apres_que", "avant_que", "a_moins_que", "wh"}  # wh: D2
+
+
+def _bounded_copular_attribute(toks, k):
+    """Existing corpus-backed attributive syntax, not a semantic predicate.
+
+    Participles deliberately remain auxiliary/passive alternatives. Neither
+    corpus unavailability nor an unknown adjective licenses this selection.
+    """
+    from brody.linguistic.lexical_corpus import lookup_surface_form
+    from brody.linguistic.lexical_corpus import corpus_identity
+    t=toks[k]
+    if not t.analyses or not any(lemma=='être' for lemma,features in t.analyses) or 'PP' in _feats(t):return None
+    j=k+1
+    while j<len(toks) and toks[j].low in _ADVERBS_SKIPPABLE|_FR_NEGATORS:j+=1
+    if j>=len(toks) or toks[j].is_punct or 'PP' in _feats(toks[j]):return None
+    if j+1<len(toks) and not toks[j+1].is_punct and toks[j+1].low not in _PREPOSITIONS|set(_CONNECTIVES):return None
+    try:
+        if corpus_identity().get('status')!='READY':return None
+        if not any(r.pos in {'adjective','adj','ADJ'} for r in lookup_surface_form(toks[j].low,lang='fr')):return None
+    except (OSError,RuntimeError):return None
+    return j
+
+
+def _copula_evidence(clause: "_Clause") -> list[tuple[int, int]]:
+    """(finite "être" index, attribute index) pairs: "c'est prêt", "le test est vert".
+
+    Only a finite, non-inverted "être" directly followed (after negators /
+    adverbs) by a non-verbal word; presence ("est là"), "est-ce", "n'est-ce" and
+    auxiliaries of a participle are not copulas here. Nothing is inferred about
+    the attribute: this is evidence of an unanalysed predication only.
+    """
+    toks, lows = clause.toks, [t.low for t in clause.toks]
+    out = []
+    for k in range(len(toks)):
+        bounded=_bounded_copular_attribute(toks,k)
+        if bounded is not None:
+            out.append((k,bounded))
+            continue
+        if not _is_verb(toks, k) or toks[k].hyphen_before or _pred(toks[k]) != "BE" \
+                or "INF" in _feats(toks[k]) or "PP" in _feats(toks[k]):
+            continue
+        j, adverb = k + 1, None
+        while j < len(toks) and lows[j] in _FR_NEGATORS | _AUX_ADVERBS:
+            adverb = j if lows[j] in _AUX_ADVERBS else adverb
+            j += 1
+        if j < len(toks) and not toks[j].is_punct and not toks[j].hyphen_before and not _is_verb(toks, j) \
+                and lows[j] not in {"là", "ici", "here", "en"}:
+            out.append((k, j))
+        elif (j >= len(toks) or toks[j].is_punct) and adverb is not None:
+            out.append((k, adverb))  # the adverb is the attribute: "c'est bien", "il est aussi"
+    return out
+
+
+_SEQUENCE_CONNECTIVES = {"et", "ou", "mais", "puis", "donc", "car", "alors"}
+# demonstrative subjects: a clause they open has the shape of a subject pronoun's ("ça parle de X")
+_DEMONSTRATIVE_SUBJECTS = {"ça", "ca", "cela", "ceci"}
+
+
+def _unanalyzed_predicative(clause: "_Clause", in_sequence: bool = False,
+                            complement_follows: bool = False) -> bool:
+    """Structural evidence of a predication whose verb is unknown (no meaning inferred).
+
+    Either an auxiliary / modal / aspectual verb followed by an unknown
+    participle or infinitive ("est parti", "va partir", "pourrait partir"), or
+    a verbless clause shaped subject + unknown word: a subject pronoun ("elle
+    appelle") or a demonstrative one ("ça parle de X"), or a nominal subject where a clause is expected ("que Paul
+    part", "si Paul part", or a clause of a sequence: "Paul frobnique le test
+    puis lance P", "Nadia exécute Q et Paul lança P"). A standalone verbless
+    utterance ("Merci Paul.", "Le test rouge.") is not a predication.
+    """
+    toks, lows = clause.toks, [t.low for t in clause.toks]
+    skip = _PRE_VERB_SKIP | _FR_NEGATORS
+    if _lost_verb_evidence(clause):
+        return True
+    if any(_is_verb(toks, k) for k in range(len(toks))):
+        return False
+    i = 1 if lows[:1] == ["si"] else 0
+    if i >= len(toks):
+        return False
+    expected = clause.conn in {"que", "si", "quand", "wh", "a_moins_que"} or i == 1
+    if lows[i] in _SUBJECT_PRONOUNS | _DEMONSTRATIVE_SUBJECTS:
+        j = i + 1
+    elif (expected or (in_sequence and _source_marker(clause.toks) is None)) and lows[i] not in _INTERJECTIONS:
+        if lows[i] in _DETERMINERS:
+            i += 1
+        if i >= len(toks) or not _content_word(toks[i]):
+            return False
+        j = i + 1
+    else:
+        return False
+    while j < len(toks) and lows[j] in skip:
+        j += 1
+    if not (j < len(toks) and _content_word(toks[j])):
+        return False
+    if lows[i] in _SUBJECT_PRONOUNS | _DEMONSTRATIVE_SUBJECTS or expected:
+        return True
+    if complement_follows and j + 1 == len(toks):
+        # D2b: "Paul ignore / se demande si P": the unknown verb's argument is the following
+        # "si / que" complement clause
+        return True
+    # a sequence clause with a nominal subject: the unknown verb must introduce an
+    # argument ("Paul frobnique le test"), so "et la gouvernance Obsidia" stays an NP
+    # ("de / du / des" mostly open a noun complement: "le contexte historique de ce projet")
+    return j + 1 < len(toks) and lows[j + 1] in (_DETERMINERS - {"de", "d'", "du", "des"}) \
+        | _OBJECT_CLITICS | {"que", "qu'"}
+
+
+def _content_operators(clause: "_Clause") -> list[str]:
+    """Scope operators detectable around unanalyzed content (never inferred meaning)."""
+    lows = [t.low for t in clause.toks]
+    ops = []
+    if any(x in {"ne", "n'"} for x in lows) and any(x in _FR_NEGATORS for x in lows):
+        ops.append("neg")
+    verbs = [t for k, t in enumerate(clause.toks) if _is_verb(clause.toks, k)]
+    tenses = {_tense_of(_feats(t)) for t in verbs}
+    if "FUTURE" in tenses or any(_pred(t) == "GO" for t in verbs):
+        ops.append("future")
+    if "CONDITIONAL" in tenses:
+        ops.append("conditional_mood")
+    if any(_cls(t) == "modal" for t in verbs):
+        ops.append("modal")
+    return ops
+
+
+_EVIDENCE_NOUNS = frozenset({"logs", "log", "traces", "journaux", "résultats", "resultats", "données", "donnees",
+                             "métriques", "metriques", "mesures"})
+
+
+def _source_marker(toks: list[_Tok]) -> str | None:
+    """Detached source / evidential adverbial clause: "selon Marie", "d'après les logs",
+    "selon moi", "apparemment". Only a bare name/pronoun (human), "moi" (speaker) or a
+    known trace noun (evidence) is recognised; anything else ("selon la procédure")
+    stays unmarked."""
+    lows = [t.low for t in toks]
+    if lows == ["apparemment"]:
+        return "INFERRED"
+    if lows[:1] == ["selon"]:
+        rest = lows[1:]
+    elif lows[:2] == ["d'", "après"] or lows[:2] == ["d'", "apres"]:
+        rest = lows[2:]
+    else:
+        return None
+    if rest == ["moi"]:
+        return "SPEAKER_BELIEF"
+    if len(rest) == 2 and rest[0] in _DETERMINERS and rest[1] in _EVIDENCE_NOUNS:
+        return "EVIDENCE_SOURCE"
+    if len(rest) == 1 and rest[0].isalpha() and rest[0] not in _DETERMINERS:
+        return "HUMAN_SOURCE"
+    return None
+
+
+def _mark_verbal_ni(clauses: list[_Clause]) -> None:
+    """"Paul n'a ni lancé P ni arrêté Q": the negation is shared by the verbal ni members.
+
+    Only when "ne" precedes the first "ni", no lexical/modal verb precedes it
+    (an auxiliary may: it is shared), a verb directly follows it, and at least
+    two "ni" coordinate verbs (same clause or ", ni ..." clauses). Every "ni"
+    must introduce a past participle sharing the auxiliary; nominal "ni"
+    (objects/subjects), bare infinitives and modal "ne doit ni ... ni" are
+    left unchanged.
+    """
+    for k, c in enumerate(clauses):
+        lows = [t.low for t in c.toks]
+        if "ni" not in lows:
+            continue
+        f = lows.index("ni")
+        if not any(x in {"ne", "n'"} for x in lows[:f]) or f + 1 >= len(lows) or not _is_verb(c.toks, f + 1):
+            continue
+        verbs = [j for j in range(f) if _is_verb(c.toks, j)]
+        # exactly one auxiliary (members are past participles) or one
+        # obligation / ability-permission / desire modal (members are infinitives),
+        # shared by every member (rebuilt on each member, see _share_auxiliary);
+        # a conditional one stays out of scope (negation vs. conditional mood open)
+        if len(verbs) != 1:
+            continue
+        shared = c.toks[verbs[0]]
+        # a conditional or second-person desire ("ne voudrait ni", "Ne veux-tu ni ... ?")
+        # is not shared either, but its ni infinitives are never injunctive: they stay
+        # open under that exact "vouloir" (negated_scope_open)
+        desire = _MODALITY.get(_pred(shared)) == "DESIRE" and "IMP" not in _feats(shared)
+        desire_open = desire and ("COND" in _feats(shared) or any(x in _SECOND_PERSON for x in lows))
+        # "ne sait ni INF ni INF": explicit distributive negation, shared like the other modals (H01/H15)
+        know_how = _MODALITY.get(_pred(shared)) == "KNOW_HOW"
+        ability = _MODALITY.get(_pred(shared)) == "ABILITY_OR_PERMISSION"
+        # "Ne peux-tu / pourrais-tu ni P ni Q ?": negated question / reproach / suggestion: not
+        # shared either, its ni infinitives stay open under that exact "pouvoir" (never injunctive)
+        ability_open = ability and any(x in _SECOND_PERSON for x in lows)
+        desire_open = desire_open or ability_open
+        if "COND" in _feats(shared) and not (desire or know_how or ability_open):
+            continue
+        modal = ability or desire or know_how or _MODALITY.get(_pred(shared)) == "OBLIGATION"
+        if not modal and _pred(shared) not in {"HAVE", "BE"}:
+            continue
+        member_feat, other_feat = ("INF", "PP") if modal else ("PP", "INF")
+        group, count = [c], lows.count("ni")
+        for d in clauses[k + 1:]:
+            if not (d.conn is None and d.boundary == "," and d.toks and d.toks[0].low == "ni"):
+                break
+            group.append(d)
+            count += sum(1 for t in d.toks if t.low == "ni")
+        after_ni = [(g.toks, j + 1) for g in group for j, t in enumerate(g.toks) if t.low == "ni"]
+        if count >= 2 and all(j < len(ts) and _is_verb(ts, j) and member_feat in _feats(ts[j])
+                              and other_feat not in _feats(ts[j]) for ts, j in after_ni):
+            if desire_open:
+                for g in group:
+                    g.ni_scope_open = shared
+                continue
+            for g in group:
+                g.ni_head = c
+            c.ni_modal = shared if modal else None
+
+
+_COMPOUND_TENSE = {"PRESENT": "PAST", "PAST": "PLUPERFECT", "FUTURE": "FUTURE", "CONDITIONAL": "CONDITIONAL"}
+
+_PERSON_FEATS = {"je": {"P1S"}, "j'": {"P1S"}, "tu": {"P2S"}, "il": {"P3S"}, "elle": {"P3S"},
+                 "on": {"P3S"}, "c'": {"P3S"}, "ça": {"P3S"}, "ca": {"P3S"}, "cela": {"P3S"},
+                 "nous": {"P1P"}, "vous": {"P2P"}, "ils": {"P3P"}, "elles": {"P3P"}}
+# D3: person of the written avoir / être auxiliary forms (their analyses carry no person)
+_AUX_PERSON = {"ai": {"P1S"}, "as": {"P2S"}, "a": {"P3S"}, "avons": {"P1P"}, "avez": {"P2P"}, "ont": {"P3P"},
+               "suis": {"P1S"}, "es": {"P2S"}, "est": {"P3S"}, "sommes": {"P1P"}, "êtes": {"P2P"},
+               "sont": {"P3P"}, "avais": {"P1S", "P2S"}, "avait": {"P3S"}, "avaient": {"P3P"}}
+# connectives after which a bare verb's subject stays open ("R si Paul lance P et exécute Q")
+_NO_SUBJECT_SHARE = {"que", "rel", "comparative", "si", "sans", "sans_que", "avant_que", "a_moins_que", "apres_que", "pour_que",
+                     "quand", "wh"}
+# subordinates that never lend their auxiliary / modal / periphrasis to a following clause
+_NO_CHAIN_SHARE = {"que", "rel", "comparative", "apres_que", "pour_que", "quand", "wh"}
+
+
+def _agrees_with_subject(tok: _Tok, host: "_Draft") -> bool:
+    """A subject-less present verb takes the host's subject only when its person
+    agrees ("Paul ... et exécute Q", "Les tests ... et exécutent Q"); a form of another
+    person never does ("Paul ... et exécutez / exécutent Q"). For a form without an
+    imperative reading, a nominal subject's number is read on the host's own finite
+    verb when it carries one (NF4: agreement required, no proximity fallback, no
+    automatic subject fusion); imperative-ambiguous forms keep the P1 contract."""
+    feats = _feats(tok)
+    if "EN" in feats or "PRES" not in feats:
+        return False
+    want = _PERSON_FEATS.get(host.subject)
+    if want is None and host.subject_person == "3":
+        own = _feats(host.lex) & {"P3S", "P3P"} if host.verb_form == "FINITE" and "IMP" not in feats else set()
+        want = own or {"P3S", "P3P"}
+    return bool((want or set()) & feats)
+
+
+def _main_imperative_only(clauses: list[_Clause], ci: int, d0: "_Draft") -> bool:
+    """After a postposed protasis, a bare subject-less imperative form that does not agree
+    with the protasis subject ("si tu veux lancer P et exécute Q", "si Paul lance P et
+    exécutez Q") cannot continue the protasis: the main imperative is its only reading."""
+    prot = next((c for c in reversed(clauses[:ci])
+                 if c.conn in _POSTPOSED_ATTACH_CONNS or c.postposed_subordinate), None)
+    host = prot.units[-1][1] if prot is not None and prot.units else None
+    return host is not None and host.subject is not None \
+        and d0.verb_form == "IMPERATIVE" and d0.head_index == d0.lex_index and d0.subject is None \
+        and d0.modality is None and "IMP" in _feats(d0.lex) and not _agrees_with_subject(d0.lex, host)
+
+
+def _share_auxiliary(clauses: list[_Clause], ci: int, drafts: list) -> None:
+    """One written auxiliary shared by coordinated past participles.
+
+    "Paul a lancé et exécuté le test", "Paul a lancé, exécuté et arrêté le
+    test": a bare participle clause (no subject, no auxiliary) coordinated by
+    "et" / "," right after a main clause ending in AUX+PP takes that compound
+    tense. "ne AUX ni PP1 ni PP2": every ni member takes the auxiliary's
+    compound tense. Ambiguous attachments (after a complement or a relative)
+    never share.
+    """
+    clause = clauses[ci]
+    if clause.ni_head is not None and clause.ni_head.ni_modal is not None:
+        # "ne doit ni INF1 ni INF2" / "ne peut ni INF1 ni INF2": the modal (its
+        # modality, tense, subject) is shared by the infinitives; its own finite
+        # draft is folded into them, exactly as in "ne doit pas INF".
+        head = clause.ni_head
+        if clause is head:
+            finite = [d for d in drafts if d.lex is head.ni_modal and d.verb_form == "FINITE"]
+            if not finite:
+                return
+            head.ni_modal = finite[0]
+            drafts.remove(finite[0])
+        m = head.ni_modal
+        if isinstance(m, _Draft):
+            for d in drafts:
+                if d.head_index > 0 and clause.toks[d.head_index - 1].low == "ni" \
+                        and d.verb_form == "INFINITIVE" and d.modality is None and d.subject is None:
+                    d.modality, d.modal_tok, d.tense = _MODALITY.get(_pred(m.lex)), m.lex, m.tense
+                    # same rule as the modal+infinitive chain: "falloir" is impersonal
+                    d.subject = m.subject
+                    d.subject_person = "impersonal" if _pred(m.lex) == "NEED" else m.subject_person
+        return
+    if clause.ni_head is not None:
+        head = clause.ni_head
+        lows = [t.low for t in head.toks]
+        aux = [t for t in head.toks[:lows.index("ni")] if t.analyses and _pred(t) in {"HAVE", "BE"}]
+        tense = _COMPOUND_TENSE.get(_tense_of(_feats(aux[0])), "PAST") if aux else None
+        for d in drafts:
+            if tense and d.head_index > 0 and clause.toks[d.head_index - 1].low == "ni" \
+                    and d.verb_form == "PARTICIPLE" and d.tense == "NONE":
+                d.tense = tense
+    elif ci > 0 and drafts and not clause.attachment_ambiguous and clause.protasis_head is None:
+        prev, d0 = clauses[ci - 1], drafts[0]
+        conns = [x.low for x in clause.conn_toks]
+        linked = conns == ["et"] or (clause.conn is None and clause.boundary == ",")
+        # "puis" / "mais" coordinate the same way; under a negated host ("ne ... pas P
+        # mais Q") a shared auxiliary / modal / periphrasis would decide the held
+        # negative scope, so only the finite subject (own inflection) is shared there
+        sequenced = clause.conn in {"puis", "mais"} and bool(conns) \
+            and set(conns) <= {"et", "puis", "ensuite", "mais"}
+        # "ou" shares the same structure over a disjunction (group kind OR); one chain
+        # never mixes "et" and "ou" members (their precedence is not decided), a comma
+        # member takes the chain's family
+        disjoined = clause.conn == "ou" and conns == ["ou"]
+        family = "or" if disjoined else prev.share_family if not conns else "and"
+        same_family = prev.share_family in (None, family)
+        negated_host = any(t.low in {"ne", "n'"} for t in prev.toks)
+        chained = same_family and (linked or ((sequenced or disjoined) and not negated_host))
+        if chained and prev.compound is not None and prev.conn not in _NO_CHAIN_SHARE \
+                and d0.head_index == d0.lex_index == 0 and d0.verb_form == "PARTICIPLE" \
+                and d0.tense == "NONE" and d0.subject is None:
+            d0.tense = prev.compound[0]
+            clause.compound = (prev.compound[0], prev.compound[1], d0)
+            clause.shared_aux_host = prev.shared_aux_host or prev
+            clause.share_family = family
+            return
+        # "Paul doit lancer P et exécuter Q": the obligation modal chain (the modal,
+        # its tense, its subject) is shared by a bare coordinated infinitive;
+        # "Veuillez lancer P et exécuter Q": so is the directive operator's scope;
+        # "Peux-tu lancer P et exécuter Q ?": so is the ability-permission modal
+        if chained and prev.modal is not None and prev.conn not in _NO_CHAIN_SHARE \
+                and _bare_infinitive(clause, d0) \
+                and d0.modality is None and d0.subject is None:
+            m = prev.modal
+            d0.modality, d0.modal_tok, d0.tense = m.modality, m.modal_tok, m.tense
+            d0.subject, d0.subject_person, d0.politeness = m.subject, m.subject_person, m.politeness
+            d0.directive, d0.compound_modal = m.directive, m.compound_modal
+            clause.modal = m
+            clause.shared_modal_host = prev.shared_modal_host or prev
+            clause.share_family = family
+            return
+        # "Paul ne veut / peut / va pas lancer P et / puis / ou / mais / , exécuter Q": the
+        # bare infinitive stays open under that exact negated operator unit, no polarity chosen
+        open_host = prev.neg_scope_open
+        if open_host is not None and same_family \
+                and (linked or disjoined or sequenced) \
+                and prev.conn not in _NO_CHAIN_SHARE \
+                and _bare_infinitive(clause, d0) \
+                and d0.modality is None and d0.subject is None:
+            d0.governed = "negated_scope_open"
+            d0.governor_span = (open_host.lex.start, open_host.lex.end)
+            clause.neg_scope_open = open_host
+            clause.share_family = family
+            return
+        # "Paul aime / vient lancer P et exécuter Q": after an infinitive governed by an
+        # unrecognised word, the bare infinitive continues that content or is independent;
+        # it is never an injunction: it takes the same open contract (named). Likewise after a
+        # governed WH infinitive ("sait comment lancer P et exécuter Q", D4-F1)
+        gov_prev = prev.units[-1][1] if prev.units else None
+        if gov_prev is not None and gov_prev.governed in {"unknown_governor", "deontic_scope_open", "wh"} \
+                and same_family and (linked or disjoined or sequenced) and prev.conn not in _NO_CHAIN_SHARE \
+                and _bare_infinitive(clause, d0) and d0.modality is None and d0.subject is None:
+            d0.governed = gov_prev.governed
+            d0.governor_span = gov_prev.governor_span
+            clause.share_family = family
+            return
+        # F-B3G-1: "Le script sert à tester Q et à lancer R", "Paul a oublié de tester Q et de
+        # lancer R": a member repeating the same preposition continues the SAME prep-governed
+        # chain (same governor, same negation, same open status); never a root injunction.
+        # A bare member ("sert à tester Q et lancer R") is not licensed to share: its attachment
+        # stays open and named, its possible request exposed fail-closed (no proximity sharing).
+        family_of = {"à": "à", "a": "à", "de": "de", "d'": "de"}
+
+        def prep_of(c, d):
+            # N2: the governing preposition, skipping only the infinitive's own negation
+            # ("de ne pas tester", "à ne jamais tester"); never further back
+            k = d.lex_index - 1
+            while 0 <= k < len(c.toks) and c.toks[k].low in _MEMBER_NEGATORS:
+                k -= 1
+            return c.toks[k].low if 0 <= k < len(c.toks) else None
+        if gov_prev is not None and gov_prev.governed in {"prep", "unknown_governor"} \
+                and gov_prev.verb_form == "INFINITIVE" and family_of.get(prep_of(prev, gov_prev)) \
+                and same_family and (linked or disjoined or sequenced) \
+                and (prev.conn not in _NO_CHAIN_SHARE or prev.conn == "rel") \
+                and d0.verb_form in {"INFINITIVE", "IMPERATIVE"} and d0.modality is None and d0.subject is None:
+            lead = [t.low for t in clause.toks[:d0.lex_index]]
+            # the member's own preposition: first, then only its negation ("et de ne pas lancer R")
+            own = lead[0] if lead and family_of.get(lead[0]) and all(x in _MEMBER_NEGATORS for x in lead[1:]) \
+                else None
+            if own is not None and family_of[own] != family_of[prep_of(prev, gov_prev)] \
+                    and "INF" in _feats(d0.lex):
+                # N3: "apprend à tester Q et de lancer R": a mismatched preposition licenses no
+                # sharing and no other governor, never a root request: attachment open, named
+                d0.verb_form, d0.tense = "INFINITIVE", "NONE"
+                clause.attachment_ambiguous = True
+                clause.share_family = family
+                return
+            if own is not None and "INF" in _feats(d0.lex):
+                # (a repeated preposition cannot open a main clause: also after a relative)
+                d0.verb_form, d0.tense = "INFINITIVE", "NONE"
+                d0.governed, d0.governor_unit = gov_prev.governed, gov_prev.governor_unit
+                d0.governor_negated, d0.governor_span = gov_prev.governor_negated, gov_prev.governor_span
+                clause.prep_member_of = prev.units[-1][0].id     # coordinated with that member
+                clause.share_family = family
+                return
+            if prev.conn not in _NO_CHAIN_SHARE and _bare_infinitive(clause, d0) and "INF" in _feats(d0.lex):
+                clause.attachment_ambiguous = True
+                d0.possible_request = True
+                clause.share_family = family
+                return
+        # "Paul sait lancer P et exécuter Q": KNOW_HOW sharing is not decided; the bare
+        # infinitive stays open under that exact savoir unit (know_how_scope_open)
+        open_host = prev.know_how_open
+        if open_host is not None and same_family and (linked or disjoined or sequenced) \
+                and prev.conn not in _NO_CHAIN_SHARE \
+                and _bare_infinitive(clause, d0) \
+                and d0.modality is None and d0.subject is None:
+            d0.governed = "know_how_scope_open"
+            d0.governor_span = (open_host.lex.start, open_host.lex.end)
+            clause.know_how_open = open_host
+            clause.share_family = family
+            return
+        # "Paul lance P et exécute Q": a bare present verb agreeing with the host's
+        # explicit subject shares that subject; it is never an imperative. The member's own
+        # "ne" before the verb does not block sharing ("Paul ne lance pas P et ne lance pas Q", D4-F2)
+        host = prev.subject_host
+        if same_family and (linked or sequenced or disjoined) and host is not None \
+                and prev.conn not in _NO_SUBJECT_SHARE \
+                and d0.head_index == d0.lex_index \
+                and all(t.low in {"ne", "n'"} for t in clause.toks[:d0.head_index]) \
+                and d0.verb_form in {"IMPERATIVE", "FINITE"} \
+                and d0.subject is None and d0.modality is None and _agrees_with_subject(d0.lex, host):
+            d0.verb_form, d0.tense = "FINITE", _tense_of(_feats(d0.lex))
+            d0.subject, d0.subject_person = host.subject, host.subject_person
+            d0.governed = None
+            clause.subject_host = host
+            clause.shared_subject_host = prev.shared_subject_host or prev
+            clause.share_family = family
+            return
+        # D3: "Paul a lancé P et a lancé / n'a pas lancé Q": a compound member with its own
+        # auxiliary agreeing with the host's explicit subject shares that subject (agreement
+        # read on the auxiliary; no proximity fallback)
+        aux = clause.toks[d0.head_index] if d0.head_index < len(clause.toks) else None
+        host_aux = prev.toks[host.head_index].low if host is not None and host.head_index < len(prev.toks) else None
+        want = _PERSON_FEATS.get(host.subject) if host is not None else None
+        if want is None and host is not None and host.head_index != host.lex_index:
+            want = _AUX_PERSON.get(host_aux)
+        if same_family and (linked or sequenced or disjoined) and host is not None \
+                and prev.conn not in _NO_SUBJECT_SHARE and aux is not None \
+                and d0.head_index != d0.lex_index and _pred(aux) in {"HAVE", "BE"} \
+                and all(t.low in {"ne", "n'"} for t in clause.toks[:d0.head_index]) \
+                and d0.subject is None and d0.modality is None and aux.low in _AUX_PERSON:
+            if want is not None and _AUX_PERSON[aux.low] == want:
+                d0.subject, d0.subject_person = host.subject, host.subject_person
+                clause.subject_host = host
+                clause.shared_subject_host = prev.shared_subject_host or prev
+            else:
+                # "Paul a lancé P et ont lancé Q": no agreement: never shared, named
+                d0.governed = "subject_unresolved"
+                clause.subject_unresolved_chain = True
+            clause.share_family = family
+            return
+        # "Paul lance P et exécutent Q": no agreement, and the form has no imperative
+        # reading: never shared, never an imperative; the subject stays unresolved (named)
+        if same_family and (linked or sequenced or disjoined) \
+                and (host is not None or prev.subject_unresolved_chain) \
+                and prev.conn not in _NO_SUBJECT_SHARE \
+                and d0.head_index == d0.lex_index == 0 and d0.verb_form in {"IMPERATIVE", "FINITE"} \
+                and d0.subject is None and d0.modality is None \
+                and {"PRES"} <= _feats(d0.lex) and not {"IMP", "EN"} & _feats(d0.lex):
+            d0.verb_form, d0.tense = "FINITE", _tense_of(_feats(d0.lex))
+            d0.governed = "subject_unresolved"
+            clause.subject_unresolved_chain = True
+            clause.share_family = family
+            return
+        # "Paul lance P et ne pas exécuter Q": no host operator licenses the negated bare
+        # infinitive; it is never an independent prohibition (NO_EXECUTE), only named
+        host = prev.subject_host
+        if same_family and (linked or sequenced or disjoined) and host is not None \
+                and host.modality is None and not host.directive and host.tense not in _PERIPHRASES \
+                and prev.conn not in _NO_CHAIN_SHARE and _bare_infinitive(clause, d0) and d0.head_index > 0 \
+                and d0.modality is None and d0.subject is None:
+            d0.governed = "unknown_governor"
+            clause.share_family = family
+            return
+    compound = [d for d in drafts if d.verb_form == "PARTICIPLE" and d.head_index != d.lex_index]
+    if compound and compound[-1] is drafts[-1]:
+        clause.compound = (compound[-1].tense, clause.toks[compound[-1].head_index].low, compound[-1])
+    last = drafts[-1] if drafts else None
+    if last is not None and last.subject is not None and not last.inverted \
+            and last.subject_person in {"1", "2", "3"} and last.verb_form != "IMPERATIVE":
+        clause.subject_host = last
+    # a negated "pouvoir" / "vouloir" ("ne peut pas P et Q": ¬(P∧Q) or ¬P∧¬Q) or one
+    # inside a protasis ("R si tu peux P et Q") has no safe scope over a coordination
+    # "Paul va lancer P et exécuter Q": the near-future periphrasis (tense, subject) is
+    # shared like a modal chain; a negated one stays open like a negated "pouvoir"
+    # (so are "venir de" RECENT_PAST and "être en train de" PROGRESSIVE)
+    near_future = last is not None and last.modality is None and not last.directive \
+        and last.tense in {"NEAR_FUTURE", "RECENT_PAST", "PROGRESSIVE"} and last.subject is not None
+    negated_head = last is not None and (any(t.low in {"ne", "n'"} for t in clause.toks[:last.head_index])
+                                         or _oral_head_negator(clause.toks, last) is not None)
+    # H15: KNOW_HOW ("sait lancer P") is a modality shared like the others; negated or in a
+    # protasis its scope over a coordination stays open (H01)
+    scope_open = last is not None and (last.modality in {"ABILITY_OR_PERMISSION", "DESIRE", "KNOW_HOW"}
+                                       or near_future) \
+        and (clause.conn == "si" or negated_head)
+    # "Paul ne doit pas lancer P et exécuter Q": a negated obligation is never shared as a
+    # positive one (nor its negation copied): its scope over Q stays open too (G2)
+    scope_open = scope_open or (last is not None and last.modality == "OBLIGATION" and negated_head
+                                and clause.conn != "si")
+    # "Paul ne veut / peut / va pas lancer P et exécuter Q": ¬(P∧Q), ¬P∧¬Q or ¬P∧Q stays
+    # held, but in every reading Q is that operator's content, never an injunction
+    # (negated_scope_open)
+    if scope_open and clause.conn != "si" and last.verb_form == "INFINITIVE" \
+            and last.head_index != last.lex_index and last.modal_tok is not None:
+        clause.neg_scope_open = last
+    if last is not None and (last.modality in {"OBLIGATION", "ABILITY_OR_PERMISSION", "DESIRE", "KNOW_HOW"}
+                             or last.directive or near_future) \
+            and not scope_open and last.verb_form == "INFINITIVE" \
+            and last.head_index != last.lex_index and last.modal_tok is not None:
+        clause.modal = last
+
+
+_PERIPHRASES = {"NEAR_FUTURE", "RECENT_PAST", "PROGRESSIVE"}
+_SENTENCE_BOUNDARIES = {".", "!", "?", ";", ":"}
+# postposed subordinates after which a coordinated member may continue the subordinate or
+# the main clause ("R si P et Q", "R sauf si / à moins que P et Q"): never attached by proximity
+_POSTPOSED_ATTACH_CONNS = {"si", "a_moins_que", "avant_que", "apres_que", "sans_que", "pour_que"}
+_MEMBER_NEGATORS = {"ne", "n'", "pas", "plus", "jamais"}
+
+
+def _bare_infinitive(clause: _Clause, d0: "_Draft") -> bool:
+    """A subject-less infinitive opening its clause, possibly after its own negation
+    ("et exécuter Q", "et ne pas exécuter Q": the negation stays local to the member)."""
+    return d0.verb_form == "INFINITIVE" and d0.head_index == d0.lex_index \
+        and all(t.low in _MEMBER_NEGATORS for t in clause.toks[:d0.head_index])
+
+
+def _relative_chain_end(toks: list, j: int, raw: str, has_object: bool) -> int:
+    """End (exclusive) of a relative's own chain starting at its first verb j: the verb chain
+    (aux + participle), its object when the relative has one (qui: a symbol or det + noun),
+    its adverbs, and its prep-governed infinitives ("sert à tester Q et à lancer R")."""
+    def obj(e: int) -> int:
+        # N1-R: the verb's own negation / manner adverbs come before its object ("qui ne teste
+        # pas P", "qui teste rapidement P"); N2-R: the object keeps its full nominal extent
+        # (existing NP parser, "le build rouge"); a bare symbol is one argument ("P")
+        if not has_object or e >= len(toks):
+            return e
+        s = e
+        while s < len(toks) and (toks[s].low in _MEMBER_NEGATORS or toks[s].low in _MANNER_ADVERBS
+                                 or toks[s].low in _ADVERBS_SKIPPABLE - {"rien"}):
+            s += 1
+        if s >= len(toks):
+            return e
+        if len(toks[s].low) == 1 and raw[toks[s].start:toks[s].end].isupper():
+            return s + 1
+        arg, nxt = _np_from(toks, s)
+        if arg is None or nxt <= s:
+            return e
+        end_of_clause = all(t.is_punct for t in toks[nxt:])
+        if end_of_clause and toks[s].low in _DETERMINERS and nxt > s + 2:
+            # N5-R: an extended NP that would consume all the remaining material leaves no
+            # room for the antecedent's (unknown) main predicate ("le build échoue"): no
+            # positive evidence for the extension; bound the object to its safe core (det +
+            # head) and keep the remainder as explicit unresolved content
+            return s + 2
+        return nxt
+    has_attested_participle = False
+    if j + 1 < len(toks) and "PP" not in _feats(toks[j + 1]):
+        try:
+            from brody.linguistic.lexical_corpus import corpus_identity, lookup_surface_form
+            has_attested_participle = (corpus_identity().get("status") == "READY" and any(
+                row.pos == "verb" and row.mood == "participle" and row.tense == "past"
+                for row in lookup_surface_form(toks[j + 1].low, lang="fr")))
+        except (OSError, RuntimeError):
+            has_attested_participle = False
+    if _pred(toks[j]) in {"HAVE", "BE"} and j + 1 < len(toks) \
+            and ("PP" in _feats(toks[j + 1]) or has_attested_participle):
+        j += 1
+    end = obj(j + 1)
+    while True:
+        e = end
+        while e < len(toks) and (toks[e].low in _MANNER_ADVERBS or toks[e].low in _ADVERBS_SKIPPABLE
+                                 or toks[e].low in _TIME_ADVERBS):
+            e += 1
+        q = e + 1 if e + 1 < len(toks) and toks[e].low in {"et", "ou"} and toks[e + 1].low in {"à", "a", "de", "d'"} \
+            else e
+        if q + 1 < len(toks) and toks[q].low in {"à", "a", "de", "d'", "pour"} and _is_verb(toks, q + 1) \
+                and "INF" in _feats(toks[q + 1]):
+            end = obj(q + 2) if has_object else q + 2
+            if not has_object:
+                end = q + 2 + (1 if q + 2 < len(toks) and len(toks[q + 2].low) == 1
+                               and raw[toks[q + 2].start:toks[q + 2].end].isupper() else 0)
+            continue
+        return e
+
+
+def _split_relative_main(clauses: list[_Clause], raw: str) -> list[_Clause]:
+    """R1-R5: the relative / main-clause boundary.
+
+    A subject antecedent (a verbless bare NP, possibly after "si", after a detached source
+    marker, or coordinated: "Paul et Nadia") followed by a relative chain ("qui ...", "que
+    ...", "que ... et qui ...") has its main predicate after the chain. The relative ends after
+    its own chain (qui: verb chain + one object; que: subject + verb chain); what follows is
+    split into its own clause, whose subject is the antecedent (never the relative's object),
+    which keeps the antecedent's condition and source. Coordinated relatives ("et / ou qui |
+    que") are sibling relatives. Structural only: no nearest / last noun fallback."""
+    # coordinated relatives: "... que Paul lance et qui teste P ..."
+    for k in range(1, len(clauses)):
+        c, p = clauses[k], clauses[k - 1]
+        # (N4-R: "puis qui / puis que" is a sequential sibling relative, PRECEDES)
+        if c.conn in {"et", "ou", "puis"} and c.toks and c.toks[0].low in {"qui", "que", "qu'"} \
+                and (p.conn == "rel" or p.rel_member):
+            c.conn_toks, c.toks = c.conn_toks + [c.toks[0]], c.toks[1:]
+            c.conn, c.rel_member, c.rel_sibling, c.embedding_parent = "rel", True, p, p.embedding_parent
+        elif c.conn == "rel" and c.conn_toks and c.conn_toks[0].low in {"et", "ou", "puis"} \
+                and (p.conn == "rel" or p.rel_member):
+            c.rel_member, c.rel_sibling = True, p                  # already "et que" / "ou qui"
+        elif c.conn == "rel" and c.boundary == "," and c.conn_toks \
+                and c.conn_toks[-1].low in {"qui", "que", "qu'"} and (p.conn == "rel" or p.rel_member):
+            c.rel_member, c.rel_sibling = True, p                  # C1: "..., que Marie observe"
+    out = list(clauses)
+    k = 1
+    while k < len(out):
+        c, ante = out[k], out[k - 1]
+        if c.conn != "rel" or c.rel_member or not c.conn_toks \
+                or c.conn_toks[-1].low not in {"qui", "que", "qu'"} or not ante.toks \
+                or any(_is_verb(ante.toks, j) for j in range(len(ante.toks))):
+            k += 1
+            continue
+        # the antecedent NP, after an optional detached source marker
+        np_toks, marker, mspan = list(ante.toks), None, None
+        if "," in [t.low for t in np_toks]:
+            cut = [t.low for t in np_toks].index(",")
+            m = _source_marker(np_toks[:cut])
+            if m is not None:
+                marker, mspan = m, (np_toks[0].start, np_toks[cut - 1].end)
+                np_toks = np_toks[cut + 1:]
+        elif np_toks and np_toks[0].low == "apparemment" and len(np_toks) > 1:
+            marker, mspan = _source_marker(np_toks[:1]), (np_toks[0].start, np_toks[0].end)
+            np_toks = np_toks[1:]
+        si_tok = None
+        if ante.conn is None and len(np_toks) > 1 and np_toks[0].low == "si":
+            # N3-R: "Si Paul et Nadia qui ...": the initial "si" stays the condition marker
+            si_tok, np_toks = np_toks[0], np_toks[1:]
+        conj = None
+        members: list[list] = [[]]
+        for t in np_toks:
+            if t.low in {"et", "ou"} and members[-1]:
+                conj = conj or t.low
+                members.append([])
+            else:
+                members[-1].append(t)
+        if not np_toks or not all(m and _bare_noun_phrase(m) for m in members):
+            k += 1
+            continue
+        if si_tok is not None:
+            # the antecedent clause is the protasis opener (its subject NP is the antecedent)
+            ante.conn, ante.conn_toks, ante.toks = "si", [si_tok], list(np_toks)
+        chain_end = k
+        while chain_end + 1 < len(out):
+            nxt = out[chain_end + 1]
+            if nxt.rel_member and nxt.conn == "rel":
+                chain_end += 1                             # "et qui / et que" sibling relative
+                continue
+            if nxt.conn in {"et", "ou", "puis"} and nxt.boundary is None and nxt.toks and _is_verb(nxt.toks, 0) \
+                    and ({"P3S", "P3P"} & _feats(nxt.toks[0]) or nxt.toks[0].low in _AUX_PERSON):
+                chain_end += 1                             # "qui testent P et observent R" (N7)
+                continue
+            if nxt.conn in {"et", "ou"} and nxt.boundary is None and len(nxt.toks) > 1 \
+                    and nxt.toks[0].low in {"à", "a", "de", "d'"} and _is_verb(nxt.toks, 1) \
+                    and "INF" in _feats(nxt.toks[1]):
+                chain_end += 1                             # "qui sert à tester Q et à lancer R"
+                continue
+            break
+        last = out[chain_end]
+        toks = last.toks
+        vs = [j for j in range(len(toks)) if _is_verb(toks, j)]
+        if not vs:
+            ante.rel_main_unresolved = True
+            k = chain_end + 1
+            continue
+        end = _relative_chain_end(toks, vs[0], raw, has_object=last.conn_toks[-1].low not in {"que", "qu'"})
+        if last.boundary == ",":
+            # NF1: a relative opened by a comma is closed by the next comma ("Le script, qui
+            # lance Q, échoue"): what follows is never object material of the relative
+            close = next((j for j in range(vs[0] + 1, len(toks)) if toks[j].low == ","), None)
+            if close is not None:
+                end = close
+        rest = toks[end:]
+        if last.boundary == "," and len(rest) > 1 and rest[0].low == "," and not rest[1].is_punct:
+            rest = rest[1:]
+        while rest and rest[-1].is_punct:
+            rest = rest[:-1]
+        if rest and (rest[0].low in _PREPOSITIONS or rest[0].low in {"à", "a", "de", "d'"}) \
+                and not _is_verb(rest, 0):
+            k = chain_end + 1              # a preposition never opens the main predicate: no split
+            continue
+        if not rest or rest[0].is_punct or rest[0].low in set(_CONNECTIVES) | {"et", "ou", "puis", "mais", "qui", "que"}:
+            # the main predicate was not found after the relative chain: named, frame open
+            # (N5-R: a following consequent never proves that a protasis predicate exists)
+            nxt = out[chain_end + 1] if chain_end + 1 < len(out) else None
+            if ante.conn != "si" and nxt is not None and nxt.conn is None and nxt.boundary == "," \
+                    and nxt.toks and _is_verb(nxt.toks, 0) and "IMP" in _feats(nxt.toks[0]) \
+                    and {"P3S", "P3P"} & _feats(nxt.toks[0]):
+                # C3: "Le script qui teste P, lance Q.": imperative or main predicate of the
+                # antecedent is not decided (H11 option C): attachment open and named, the
+                # possible request exposed, never a definitive REQUESTED
+                nxt.attachment_ambiguous = nxt.rel_member_possible_request = True
+            elif ante.conn == "si" or not any(c.conn not in {"rel", "et", "ou", "puis"}
+                                              for c in out[chain_end + 1:chain_end + 2]):
+                ante.rel_main_unresolved = True
+            k = chain_end + 1
+            continue
+        last.toks = toks[:end]
+        main = _Clause(list(rest), "si" if ante.conn == "si" else None, [],
+                       embedding_parent=ante.embedding_parent)
+        main.main_after_relative, main.after_rel = True, last
+        main.main_subject = " ".join(t.low for m in members for t in m if t.low not in _DETERMINERS) \
+            if len(members) == 1 else f" {conj} ".join(
+                " ".join(t.low for t in m if t.low not in _DETERMINERS) for m in members)
+        if len(members) > 1:
+            main.main_subject_members = (members, conj)
+        if marker is not None:
+            main.evidential, main.evidential_span = marker, mspan
+            ante.toks = np_toks
+        elif ante.evidential is not None:
+            main.evidential, main.evidential_span, ante.evidential = ante.evidential, ante.evidential_span, None
+        if ante.conn == "si":
+            # R3: the main predicate of a protasis subject belongs to that protasis
+            main.protasis_head = ante.protasis_head = ante.protasis_head or ante
+        out.insert(chain_end + 1, main)
+        k = chain_end + 2
+    return out
+
+
+def _continues_prep_chain(prev: _Clause, clause: _Clause) -> bool:
+    """N4: "... apprend à tester Q et à lancer R": the member opens with the same preposition
+    (+ only its negation) and an infinitive, and the previous clause holds a governed
+    "prep (+ negation) + infinitive" with that preposition. Structural only, no proximity."""
+    fam = {"à": "à", "a": "à", "de": "de", "d'": "de"}
+    toks = clause.toks
+    if not toks or toks[0].low not in fam:
+        return False
+    j = 1
+    while j < len(toks) and toks[j].low in _MEMBER_NEGATORS:
+        j += 1
+    if j >= len(toks) or not _is_verb(toks, j) or "INF" not in _feats(toks[j]):
+        return False
+    pt = prev.toks
+    for k in range(len(pt) - 1):
+        if fam.get(pt[k].low) == fam[toks[0].low] and k > 0 and _is_verb(pt, k - 1) or (
+                fam.get(pt[k].low) == fam[toks[0].low] and k > 0 and pt[k - 1].low in _MEMBER_NEGATORS):
+            m = k + 1
+            while m < len(pt) and pt[m].low in _MEMBER_NEGATORS:
+                m += 1
+            if m < len(pt) and _is_verb(pt, m) and "INF" in _feats(pt[m]):
+                return True
+    return False
+
+
+def _continues_protasis_modal(prev: _Clause, clause: _Clause) -> bool:
+    """H11 option C: "R si Paul veut lancer P et exécuter Q": a bare infinitive (infinitive
+    morphology only, no subject, no imperative reading) after a modal chain of the protasis
+    is licensed only as the continuation of that chain: it joins the protasis. Never decided
+    by proximity: any other member stays open."""
+    toks = clause.toks
+    if not toks or not toks[0].analyses or toks[0].low in _MEMBER_NEGATORS:
+        # "et ne pas exécuter Q": one reading is a main-clause prohibition, kept in doubt
+        return False
+    feats = _feats(toks[0])
+    if "INF" not in feats or {"PRES", "IMP", "PP"} & feats:
+        return False
+    return any(t.analyses and _cls(t) == "modal" for t in prev.toks)
+
+
+def _share_kind(sharers: list[_Clause]) -> str:
+    """Kind of a sharing group: OR when its members are joined by "ou" (never mixed with "et")."""
+    return "OR" if any(c.conn == "ou" for c in sharers) else "AND"
+
+
+def _is_complement(clause: _Clause) -> bool:
+    return clause.conn == "que" or (clause.conn == "rel" and clause.governor_lost)
+
+
+def _coordinated_complement(clauses: list[_Clause]) -> tuple[_Clause | None, bool]:
+    """"V que P et que Q" / "V que P ou que Q": (the complement P that Q coordinates with, ambiguous).
+
+    P is a "que" complement, or one whose governor was lost (Q then shares that
+    unknown governance). Only for a unique syntactic governor: when P's governor
+    is itself a "que" complement, Q could complement either governor, and the
+    attachment stays ambiguous.
+    """
+    if len(clauses) < 2:
+        return None, False
+    c, prev = clauses[-1], clauses[-2]
+    if c.toks or c.conn not in {"et", "ou"} or not _is_complement(prev):
+        return None, False
+    if prev.attachment_ambiguous:
+        return None, True
+    gov = prev.embedding_parent
+    if gov is None or not 0 <= gov < len(clauses) - 2:
+        return None, False
+    if clauses[gov].conn == "que":
+        return None, True
+    return prev, False
+
+
+_WH_COMPLEMENT_WORDS = {"qui", "quand", "comment", "pourquoi", "où", "combien"}
+_HYPHEN_OBJECT_PRONOUNS = {"moi", "toi", "lui", "nous", "vous", "leur", "le", "la", "les"}
+_TONIC_PRONOUNS = {"moi", "toi", "lui", "elle", "nous", "vous", "eux", "elles"}
+_DISTRIBUTIVE_FLOATS = {"chacun", "chacune"}
+_PARTITIVE_QUANTIFIERS = {"chacun", "chacune", "un", "une"}  # + de / des / du NP
+# D5-N7: manner words reported when found around a unit's arguments ("maintenant" and
+# "immédiatement" are temporal cues, N12-T)
+_MANNER_MARKED = {"seul", "seule", "seuls", "seules", "vite", "ensemble", "automatiquement",
+                  "directement", "rapidement", "lentement", "manuellement", "indirectement", "mieux"}
+# MannerRef: only modifiers whose kind is fixed by the word itself. "automatiquement"
+# (automated / systematically / by reflex), "directement", "indirectement" stay reported
+_TYPED_MANNER = {"vite": ("RATE", "FAST"), "rapidement": ("RATE", "FAST"),
+                 "lentement": ("RATE", "SLOW"), "manuellement": ("EXECUTION_MODE", "MANUAL"),
+                 # Relative evaluation only: no axis, comparator or measured result is supplied.
+                 "mieux": ("COMPARATIVE_DEGREE", "BETTER_UNSPECIFIED_STANDARD")}
+# prepositions kept out of _PREPOSITIONS (subordinator / governor roles elsewhere) that still
+# end an object and open conservable prepositional content ("p via ssh", "p depuis")
+_OBJECT_BOUNDARY_PREPOSITIONS = {"via", "depuis"}
+_RELATIVE_PRONOUNS = {"qui", "que", "qu'", "dont", "où", "lequel", "laquelle", "lesquels", "lesquelles"}
+# ObliqueArgumentRef V0 (O2): constructions that license a role; any other preposition is UNRESOLVED
+_LICENSED_OBLIQUES = (
+    (("en", "utilisant"), "en utilisant", "INSTRUMENT"),
+    (("à", "l'", "aide"), "à l'aide de", "INSTRUMENT"),
+    (("a", "l'", "aide"), "à l'aide de", "INSTRUMENT"),
+    (("au", "moyen"), "au moyen de", "INSTRUMENT"),
+    (("à", "partir"), "à partir de", "SOURCE"),
+    (("a", "partir"), "à partir de", "SOURCE"),
+)
+
+
+def _oblique_members(toks: list, k: int, end: int):
+    """Parse toks[k:end + 1] as ONE oblique construction: (marker, role, args, links) or None.
+
+    None (the caller keeps the S11 fallback) unless the whole remainder is consumed: the
+    marker, then argument NPs joined by "et" / "ou" / "," (an optional repeated "de")."""
+    lows = [t.low for t in toks[k:end + 1]]
+    marker, role, j = None, "UNRESOLVED", k
+    for head, name, licensed in _LICENSED_OBLIQUES:
+        if tuple(lows[:len(head)]) == head:
+            marker, role, j = name, licensed, k + len(head)
+            if head[-1] in {"aide", "moyen", "partir"}:
+                if j > end or toks[j].low not in {"de", "d'", "du", "des"}:
+                    return None
+                j += 1 if toks[j].low in {"de", "d'"} else 0
+            break
+    if marker is None:
+        if lows[0] not in _PREPOSITIONS and lows[0] not in _OBJECT_BOUNDARY_PREPOSITIONS and lows[0]!="comme":
+            return None
+        marker, j = ("à" if lows[0] == "a" else lows[0]), k + 1
+    args, links = [], []
+    while j <= end:
+        t = toks[j]
+        if t.low in _TIME_ADVERBS and not t.analyses:
+            arg, nj = Argument(t.low, t.low, "NP", "DEICTIC", span=(t.start, t.end)), j + 1
+        else:
+            arg, nj = _np_from(toks, j)
+        if arg is None or nj > end + 1:
+            return None
+        args.append(arg)
+        j = nj
+        if j <= end and toks[j].low in {"et", "ou", ","}:
+            links.append(toks[j].low)
+            j += 1
+            if j <= end and toks[j].low in {"de", "d'"}:
+                j += 1
+            continue
+        break
+    if not args or j != end + 1:
+        return None
+    return marker, role, args, links
+
+
+_TOTALITY_QUANTIFIERS = {"tous", "toutes", "tout", "toute"}  # + determiner NP
+_TONIC_AGENT = {"moi": "SPEAKER", "toi": "ADDRESSEE"}
+_SUBJECT_INTRODUCERS = {"si", "que", "qu'", "comme", "dès", "pendant", "lorsque", "lorsqu'", "quand", "depuis"}
+_PLURAL_AUX = {"ont", "sont", "vont", "avons", "sommes", "allons", "avez", "êtes", "allez", "font", "doivent",
+               "peuvent", "veulent", "savent", "viennent"}
+
+
+def _bare_noun_phrase(ts: list) -> bool:
+    """An optional determiner and one or two unknown content words ("Nadia", "le test")."""
+    words = [t for t in ts if t.low not in _DETERMINERS]
+    return bool(words) and len(ts) - len(words) <= 1 and len(words) <= 2 \
+        and all(_content_word(t) and not t.hyphen_before for t in words)
+
+
+def _plural_verb(tok) -> bool:
+    feats = _feats(tok)
+    # D5-N1: future / conditional analyses carry no person feature; their plural endings do
+    return bool(feats & {"P1P", "P2P", "P3P"}) or tok.low in _PLURAL_AUX         or ("FUT" in feats and tok.low.endswith(("rons", "rez", "ront")))         or ("COND" in feats and tok.low.endswith(("rions", "riez", "raient")))
+
+
+def _finite_clause_after(toks: list[_Tok], i: int) -> bool:
+    """A verb follows the WH word at i before the next punctuation ("qui a lancé P")."""
+    for j in range(i + 1, len(toks)):
+        if toks[j].low in {".", "!", "?", ";", ","}:
+            return False
+        if _is_verb(toks, j):
+            return True
+    return False
+
+
+def _wh_complement_governor(toks: list[_Tok], i: int) -> "_Tok | None":
+    """The verb governing a WH complement ("Je sais quand P", "Dis-moi comment P"): only the
+    verb right before the WH word (or before its hyphenated pronoun), and only when a finite
+    clause follows ("Dis-moi comment lancer P" stays a WH infinitive)."""
+    if toks[i].low not in _WH_COMPLEMENT_WORDS or i == 0 or i + 1 >= len(toks):
+        return None
+    nxt = toks[i + 1]
+    if nxt.is_punct or nxt.low in {"même", "meme"}:
+        return None
+    if _is_verb(toks, i + 1) and toks[i].low != "qui":
+        return None
+    if toks[i].low == "qui" and _is_verb(toks, i + 1) and "INF" in _feats(nxt) and not (_feats(nxt) - {"INF"}):
+        return None
+    g = i - 1
+    while g >= 0 and (
+        toks[g].low in _FR_NEGATORS
+        or (toks[g].hyphen_before and toks[g].low in (_HYPHEN_OBJECT_PRONOUNS | _SUBJECT_PRONOUNS))
+    ):
+        g -= 1
+    if g < 0 or not _is_verb(toks, g):
+        return None
+    for j in range(i + 2, len(toks)):
+        if toks[j].low in {".", "!", "?", ";", ","}:
+            return None
+        if _is_verb(toks, j):
+            return toks[g]
+    return None
+
+
+def _subordinating_quand(toks: list[_Tok], i: int) -> bool:
+    """"quand" opening a subordinate clause, not an interrogative or idiomatic one.
+
+    Not: "quand même", "quand" followed by a verb ("Quand lances-tu P ?",
+    "Quand est-ce que ..."), after a preposition ("depuis quand", "n'importe
+    quand") or right after a verb / hyphenated pronoun (indirect question:
+    "Dis-moi quand P", "Je sais quand P"). A clause-initial "quand" is one only
+    when a comma follows it in the sentence ("Quand Q, P"; "Quand Paul lance-t-il
+    P ?" stays a question).
+    """
+    nxt = toks[i + 1] if i + 1 < len(toks) else None
+    if nxt is None or nxt.is_punct or nxt.low in {"même", "meme"} or _is_verb(toks, i + 1):
+        return False
+    prev = toks[i - 1] if i > 0 else None
+    if prev is None or prev.is_punct or prev.low in _CONNECTIVES:
+        for t in toks[i + 1:]:
+            if t.low == ",":
+                return True
+            if t.low in {".", "!", "?", ";", ":"}:
+                return False
+        return False
+    if prev.low in _PREPOSITIONS | {"depuis", "importe", "jusqu'", "jusqu'à"} or prev.hyphen_before:
+        return False
+    return not _is_verb(toks, i - 1)
+
+
+def _segment(toks: list[_Tok]) -> tuple[list[_Clause], bool]:
+    clauses: list[_Clause] = [_Clause([])]
+    interrogative = False
+    i = 0
+
+    def cur() -> _Clause:
+        return clauses[-1]
+
+    def open_clause(conn: str | None, conn_toks: list, parent: int | None = None) -> None:
+        if cur().toks:
+            clauses.append(_Clause([], conn, conn_toks, embedding_parent=parent))
+        else:
+            if conn is not None:
+                cur().conn = conn
+            cur().conn_toks += conn_toks
+            if parent is not None:
+                cur().embedding_parent = parent
+
+    while i < len(toks):
+        t = toks[i]
+        nxt = toks[i + 1] if i + 1 < len(toks) else None
+        nxt2 = toks[i + 2] if i + 2 < len(toks) else None
+        low = t.low
+
+        # D5: a sentence-initial "apparemment" without its comma is the same detached
+        # evidential as "Apparemment, P": never fused into the subject ("apparemment marie"),
+        # never an unhedged realized assertion
+        if low == "apparemment" and not cur().toks and nxt is not None and not nxt.is_punct \
+                and (i == 0 or toks[i - 1].low in {".", "!", "?", ";"}):
+            cur().toks.append(t)
+            open_clause(None, [])
+            i += 1
+            continue
+        # D2: "Paul sait si P" / "savoir si P": an interrogative complement of savoir (H13
+        # channel: EMBEDS interrogative_complement), never a conditional protasis
+        if low == "si" and i > 0:
+            g = i - 1
+            while g >= 0 and (toks[g].low in _FR_NEGATORS
+                              or (toks[g].hyphen_before and toks[g].low in _SUBJECT_PRONOUNS)):
+                g -= 1  # "Sais-tu si P ?": the inverted pronoun belongs to savoir
+            end = next((j for j in range(i + 1, len(toks)) if toks[j].is_punct), len(toks))
+            if g >= 0 and _is_verb(toks, g) and _pred(toks[g]) == "KNOW" \
+                    and any(_is_verb(toks, j) for j in range(i + 1, end)):
+                open_clause("wh", [t])
+                cur().wh_governor = toks[g]
+                i += 1
+                continue
+
+        if t.is_punct:
+            if low == "?":
+                interrogative = True
+            open_clause(None, [])
+            cur().boundary, cur().boundary_tok = low, t
+            i += 1
+            continue
+
+        # "est-ce que" / "est-ce qu'" — interrogative marker, not a predicate.
+        if low == "est" and nxt is not None and nxt.low == "ce" and nxt.hyphen_before \
+                and nxt2 is not None and nxt2.low in {"que", "qu'"}:
+            interrogative = True
+            i += 3
+            continue
+
+        # Complex subordinators.
+        # "sauf si P", "excepté si P", "sauf s'il P": exception condition, same family as
+        # "à moins que" (H17); "sauf" is never absorbed into the preceding object
+        if low in {"sauf", "excepté", "excepte"} and nxt is not None and (
+                nxt.low == "si" or (nxt.low == "s'" and nxt2 is not None and nxt2.low in _ELIDED_SI_SUBJECTS)):
+            open_clause("a_moins_que", [t, nxt])
+            i += 2
+            continue
+        if low in {"sauf", "excepté", "excepte"} and nxt is not None and nxt.low in {"quand", "lorsque", "lorsqu'"}:
+            # "sauf quand / excepté lorsque P": temporal subordinate + exception (H17, H05)
+            open_clause("quand", [t, nxt])
+            i += 2
+            continue
+        if low in {"avant", "before"} and nxt is not None and nxt.low in {"de", "d'"}:
+            open_clause("avant_de", [t, nxt])
+            i += 2
+            continue
+        if low == "avant" and nxt is not None and nxt.low in {"que", "qu'"}:
+            open_clause("avant_que", [t, nxt])
+            i += 2
+            continue
+        # D7: "pour que / afin que P": a purpose subordinate, never a relative nor "pour" object
+        if low in {"pour", "afin"} and nxt is not None and nxt.low in {"que", "qu'"}:
+            open_clause("pour_que", [t, nxt])
+            i += 2
+            continue
+        if low in {"à", "a"} and nxt is not None and nxt.low == "moins" \
+                and nxt2 is not None and nxt2.low in {"que", "qu'"}:
+            open_clause("a_moins_que", [t, nxt, nxt2])
+            i += 3
+            continue
+        # "pendant que P": temporal subordinator (H05, OVERLAPS), never a lost-governor "que"
+        if low == "pendant" and nxt is not None and nxt.low in {"que", "qu'"}:
+            open_clause("quand", [t, nxt])
+            i += 2
+            continue
+        # "de sorte que P", "jusqu'à ce que P": subordinators, never a relative on a noun /
+        # "ce"; their meaning is not analysed here: lost-governor complement contract (N14)
+        span = [x.low for x in toks[i:i + 4]]
+        n_sub = 3 if span[:3] == ["de", "sorte", "que"] or span[:3] == ["de", "sorte", "qu'"] else \
+            4 if span[:3] == ["jusqu'", "à", "ce"] and span[3:4] in (["que"], ["qu'"]) else 0
+        if n_sub and cur().toks:
+            open_clause("rel", toks[i:i + n_sub], parent=len(clauses) - 1)
+            cur().governor_lost = cur().postposed_subordinate = True
+            i += n_sub
+            continue
+        if low == "parce" and nxt is not None and nxt.low in {"que", "qu'"}:
+            open_clause("car", [t, nxt])
+            i += 2
+            continue
+        if low == "sans":
+            if nxt is not None and nxt.low in {"que", "qu'"}:
+                open_clause("sans_que", [t, nxt])
+                i += 2
+            else:
+                open_clause("sans", [t])
+                i += 1
+            continue
+        # "après que Q": a temporal subordinate (Q before its host), never a relative
+        if low in {"après", "apres"} and nxt is not None and nxt.low in {"que", "qu'"} \
+                and not (cur().toks and cur().toks[-1].low == "d'"):
+            open_clause("apres_que", [t, nxt])
+            i += 2
+            continue
+        # "Je sais quand P", "Dis-moi comment P": a WH complement of the adjacent verb
+        gov = _wh_complement_governor(toks, i)
+        if gov is not None:
+            open_clause("wh", [t])
+            cur().wh_governor = gov
+            i += 1
+            continue
+        # "Paul se demande qui / où / quand P": WH complement of a governor unknown to the
+        # lexicon; the governor is kept unresolved (as for "que"), the complement is
+        # interrogative content, never a relative nor an asserted event. No profile is
+        # implied: SYNTAX RECOGNITION != SEMANTIC PROFILE AVAILABILITY.
+        governor_at = _unresolved_governor_index(cur().toks) \
+            if low in _WH_COMPLEMENT_WORDS and cur().toks and _finite_clause_after(toks, i) else None
+        if governor_at is not None:
+            wg = cur().toks[governor_at]
+            cur().unresolved_governor = governor_at
+            open_clause("wh", [t])
+            cur().wh_governor = wg
+            i += 1
+            continue
+        # "quand" / "lorsque" Q: a temporal subordinate whose meaning stays held
+        if low in _TEMPORAL_INTRODUCERS or (low == "quand" and _subordinating_quand(toks, i)):
+            open_clause("quand", [t])
+            i += 1
+            continue
+        # "d'après X" is a source adverbial, never the temporal connective.
+        if low in {"après", "apres"} and cur().toks and cur().toks[-1].low != "d'":
+            open_clause("apres", [t])
+            i += 1
+            continue
+
+        # "puis-je" is pouvoir, not the connective.
+        if _is_puis_je(t, nxt):
+            cur().toks.append(t)
+            i += 1
+            continue
+
+        # Elided conditional "si" before il/ils/elle/elles: "s'il", "s'ils".
+        if low == "s'" and nxt is not None and nxt.low in _ELIDED_SI_SUBJECTS                 and not _politeness_formula(toks, i):
+            open_clause("si", [t])
+            i += 1
+            continue
+
+        if low in {"si", "if"}:
+            if nxt is not None and (nxt.low in _SUBJECT_PRONOUNS | _DETERMINERS
+                                    or nxt.low in {"c'", "ça", "ca", "it"}
+                                    or _si_nominal_subject(toks, i)
+                                    or _si_unresolved_governor(toks, i)):
+                open_clause("si", [t])
+                i += 1
+                continue
+            # NF2: "Si, selon Marie, P": a detached source between "si" and its protasis
+            # qualifies the protasis; it never replaces nor neutralises the condition marker
+            close = next((j for j in range(i + 2, len(toks)) if toks[j].is_punct), None) \
+                if nxt is not None and nxt.low == "," else None
+            src = toks[i + 2:close] if close is not None and toks[close].low == "," else []
+            after = toks[close + 1] if src and close + 1 < len(toks) else None
+            if after is not None and _source_marker(src) is not None \
+                    and (after.low in _SUBJECT_PRONOUNS | _DETERMINERS or after.low in {"c'", "ça", "ca"}
+                         or _si_nominal_subject(toks, close) or _si_unresolved_governor(toks, close)):
+                open_clause("si", [t])
+                cur().evidential, cur().evidential_span = _source_marker(src), (src[0].start, src[-1].end)
+                i = close + 1
+                continue
+
+        if low in _CONNECTIVES and low not in {"si", "if", "que", "qu'"}:
+            conn = _CONNECTIVES[low]
+            # "et puis" / ", puis": keep the most informative connective.
+            if not cur().toks and cur().conn in {"et"} and conn == "puis":
+                cur().conn = "puis"
+                cur().conn_toks.append(t)
+            elif conn == "alors" and not cur().toks:
+                cur().conn_toks.append(t)
+                if cur().conn is None:
+                    cur().conn = "alors"
+            else:
+                open_clause(conn, [t])
+            i += 1
+            continue
+
+        if low in {"que", "qu'"}:
+            c = cur()
+            if not c.toks and c.conn == "et" and len(clauses) >= 2 and clauses[-2].conn == "si":
+                # "si P et que Q": "que" takes up "si"; Q joins the protasis.
+                c.conn, c.conn_toks = "si", c.conn_toks + [t]
+                i += 1
+                continue
+            sibling, ambiguous = _coordinated_complement(clauses)
+            if sibling is not None:
+                c.conn, c.conn_toks, c.governor_lost = sibling.conn, c.conn_toks + [t], sibling.governor_lost
+                c.embedding_parent, c.coordinated_with = sibling.embedding_parent, sibling
+                i += 1
+                continue
+            if ambiguous:
+                c.conn, c.conn_toks, c.attachment_ambiguous = "que", c.conn_toks + [t], True
+                i += 1
+                continue
+            verb = _last_verb(c.toks)
+            vcls = _cls(verb) if verb is not None else "none"
+            vpred = _pred(verb) if verb is not None else ""
+            has_ne = any(x.low in {"ne", "n'"} for x in c.toks)
+            prev = c.toks[-1] if c.toks else None
+            embedding = (vcls.startswith("embedding") or vpred in {"WANT", "NEED"}
+                         or any(x.low == "peur" for x in c.toks)
+                         or any(x.low in {"paraît", "parait"} for x in c.toks))
+            comparative = any(x.low in {"plus", "moins", "mieux", "autant", "pire"}
+                              for x in c.toks) and not has_ne
+            governor_at = None if embedding else _unresolved_governor_index(c.toks)
+            # A corpus-ambiguous noun at the end of a complete nominal carrier
+            # must not become a complement governor for the following relative
+            # "que" (for example, "Les lettres qu'elle a ecrites"). Preserve
+            # the existing complement-head exception such as "le fait que".
+            lows_c = [x.low for x in c.toks]
+            nominal = prev is None or prev.low in _ANTECEDENT_PRONOUNS or (
+                len(c.toks) >= 2 and c.toks[-2].low in _DETERMINERS) or bool(
+                {"c'", "ce"} & set(lows_c) or _DEGREE_WORDS & set(lows_c[1:]))
+            nominal_relative = nominal and (len(lows_c) < 2 or tuple(lows_c[-2:]) not in _COMPLEMENT_HEADS)
+            if embedding:
+                open_clause("que", [t], parent=len(clauses) - 1)
+            elif nominal_relative:
+                open_clause("rel", [t], parent=len(clauses) - 1)
+                cur().governor_lost = False
+            elif governor_at is not None:
+                c.unresolved_governor = governor_at
+                open_clause("que", [t], parent=len(clauses) - 1)
+            elif _known_complement_governor(c.toks, toks, i):
+                open_clause("que", [t], parent=len(clauses) - 1)
+            elif has_ne and verb is not None:
+                negs = [x for x in c.toks if x.low in _FR_NEGATORS]
+                c.restriction = "NOT_ONLY" if (prev is not None and prev.low == "pas") else (
+                    None if negs else "ONLY")
+                if c.restriction is None:
+                    open_clause("que", [t], parent=len(clauses) - 1)
+                else:
+                    c.restriction_at = len(c.toks)
+                    c.toks.append(t)
+            elif comparative:
+                open_clause("comparative", [t], parent=len(clauses) - 1)
+            else:
+                # A relative "que" follows a nominal antecedent (det + noun, "ce").
+                # Otherwise the governor of this complement could not be
+                # recognised; it must stay subordinated (see pragmatics).
+                # Clefts ("c'est Paul que") and degree consecutives ("si rapide
+                # que") are not complements either.
+                open_clause("rel", [t], parent=len(clauses) - 1)
+                cur().governor_lost = not nominal
+            i += 1
+            continue
+        # NF1: ", qui V" after a nominal carrier ("Le script, qui lance Q, échoue") is the same
+        # descriptive relative as "le script qui": never a clause-initial (imperative) verb
+        comma_rel = low == "qui" and not cur().toks and cur().conn is None and cur().boundary == "," \
+            and len(clauses) >= 2 and clauses[-2].toks and not clauses[-2].toks[-1].hyphen_before \
+            and not _is_verb(clauses[-2].toks, len(clauses[-2].toks) - 1)
+        if low == "qui" and (cur().toks or comma_rel):
+            open_clause("rel", [t], parent=len(clauses) - 1)
+            i += 1
+            continue
+
+        cur().toks.append(t)
+        i += 1
+
+    clauses = [c for c in clauses if c.toks or c.conn_toks]
+    # A "clause" without any verb is NP material (coordination, apposition):
+    # reattach it to the previous clause, connective included.
+    merged: list[_Clause] = []
+    lost_complement = False
+    pending_source = None
+    for c in clauses:
+        # D5: a clause-internal "apparemment" ("Marie a apparemment lancé P", "Marie lance
+        # apparemment P") is that clause's evidential (span kept); never subject / object material
+        inner = [k for k, t in enumerate(c.toks) if t.low == "apparemment" and k > 0]
+        if inner and c.evidential is None and len(c.toks) > 1:
+            t = c.toks[inner[0]]
+            c.evidential, c.evidential_span = _source_marker([t]), (t.start, t.end)
+            c.toks = c.toks[:inner[0]] + c.toks[inner[0] + 1:]
+        has_verb = c.unresolved_governor is not None or any(
+            _is_verb(c.toks, k) for k in range(len(c.toks)))
+        # A clause opened by punctuation (conn None) holding only a source adverbial:
+        # clause-initial ("Selon Marie, P") marks the next clause, clause-final
+        # ("P, selon Marie") the previous one.
+        marker = _source_marker(c.toks) if c.conn is None else None
+        span = (c.toks[0].start, c.toks[-1].end) if marker is not None else None
+        # D5: a source that opens a new sentence ("P. Apparemment, Q") marks Q, never the
+        # previous sentence
+        sentence_initial = not merged or c.boundary in {".", "!", "?", ";"}
+        if marker is not None and sentence_initial and merged:
+            pending_source = (marker, span)
+            merged.append(c)
+            continue
+        if marker is not None and merged and merged[-1].units == [] and any(
+                _is_verb(merged[-1].toks, k) for k in range(len(merged[-1].toks))):
+            if merged[-1].evidential is None:
+                merged[-1].evidential, merged[-1].evidential_span = marker, span
+            # S12: the source is consumed by the evidential; it never becomes object material
+            # ("Lance P, selon Paul" read "selon paul" as a second object)
+            continue
+        elif marker is not None and not merged:
+            pending_source = (marker, span)
+        if marker is None and has_verb and c.conn is None and pending_source is not None:
+            (c.evidential, c.evidential_span), pending_source = pending_source, None
+        # A verbless clause shaped like a predication with an unknown verb
+        # ("elle appelle Luc") is kept as its own (unanalyzed) clause, and so is
+        # a verbless "quand / lorsque" subordinate ("lorsque Nadia et Luc V"), and a verbless
+        # exception ("Lance R sauf si P": never "r sauf", never an ordinary protasis, F1).
+        # NF2: a protasis opener ("Selon Marie, si le script qui ...") is never fused into the
+        # preceding detached source clause: "si" keeps governing its own protasis
+        if not has_verb and merged and c.conn not in {"sans", "sans_que", "quand", "wh", "a_moins_que", "comparative"} \
+                and not (c.conn == "si" and merged[-1].conn is None
+                         and _source_marker(merged[-1].toks) is not None) \
+                and not _unanalyzed_predicative(c, in_sequence=c.conn in _SEQUENCE_CONNECTIVES
+                                                or (c.conn is None and c.boundary == ",")):
+            prev = merged[-1]
+            # D5-R2: a merged comma tail keeps its comma, so NP members never fuse ("P, Q")
+            comma = [c.boundary_tok] if c.boundary == "," and c.boundary_tok is not None and not c.conn_toks else []
+            prev.toks += comma + c.conn_toks + c.toks
+            # "V que le test que P V2": the complement opener only held its
+            # subject NP; the relative that follows also carries V2.
+            lost_complement = _is_complement(c)
+            continue
+        c.complement_structure_lost = lost_complement and c.conn == "rel"
+        lost_complement = False
+        merged.append(c)
+    # Re-index embedding parents after merging.
+    return merged, interrogative
+
+
+# ── 4-6. predicate units ─────────────────────────────────────────────────
+@dataclass
+class _Draft:
+    lex: _Tok
+    lex_index: int
+    head_index: int               # index of the finite/first verb of the chain
+    verb_form: str
+    tense: str = "NONE"
+    modality: str | None = None
+    politeness: bool = False
+    modal_tok: _Tok | None = None
+    subject: str | None = None
+    subject_person: str | None = None
+    inverted: bool = False
+    governed: str | None = None          # wh | prep | purpose | temporal | permission
+    governor_unit: str | None = None
+    governor_negated: bool = False
+    governor_span: tuple | None = None   # exact governor token of a negated_scope_open infinitive
+    unresolved_governor: bool = False    # unknown verb kept only as a "que" governor
+    directive: bool = False              # under a written directive operator ("veuillez" + inf)
+    compound_modal: bool = False         # "a pu / a dû / a voulu V": compound-tense modal chain
+    possible_request: bool = False       # ambiguous attachment with one addressee-request reading
+
+
+_MODALITY = {"ABLE": "ABILITY_OR_PERMISSION", "MUST": "OBLIGATION",
+             "NEED": "OBLIGATION", "WANT": "DESIRE", "KNOW": "KNOW_HOW"}
+
+
+def _tense_of(feats: frozenset) -> str:
+    for f, name in (("FUT", "FUTURE"), ("COND", "CONDITIONAL"), ("IMPF", "PAST"),
+                    ("PAST_SIMPLE", "PAST"), ("PRES", "PRESENT"), ("SUBJ", "PRESENT")):
+        if f in feats:
+            return name
+    return "NONE"
+
+
+def _next_verb(toks: list[_Tok], start: int, allow: set) -> int | None:
+    """Index of the next verb after start, skipping only tokens in allow."""
+    k = start
+    while k < len(toks):
+        # The caller licenses these closed-class positions inside its verbal
+        # chain. A lexical homograph there is not a second finite predicate.
+        if toks[k].low in allow:
+            k += 1
+            continue
+        if _is_verb(toks, k):
+            return k
+        return None
+    return None
+
+
+def _subject_before(toks: list[_Tok], idx: int) -> tuple[str | None, str | None]:
+    """Subject text and person for the verb chain starting at idx."""
+    k = idx - 1
+    while k >= 0 and toks[k].low in (_OBJECT_CLITICS | _REFLEXIVE_CLITICS
+                                     | {"ne", "n'", "y", "en"} | _EN_NEGATORS | {"do", "does", "did"}):
+        k -= 1
+    if k < 0:
+        return None, None
+    t = toks[k]
+    if t.low in _SUBJECT_PRONOUNS:
+        person = "2" if t.low in _SECOND_PERSON else ("1" if t.low in _FIRST_PERSON else "3")
+        return t.low, person
+    if t.low in {"c'", "ça", "ca", "cela"}:
+        return t.low, "3"
+    if t.low == "qui" and k == 0:
+        # WH_REQUEST: a clause-initial "qui" with no carrier ("Qui lance Q ?") is the
+        # (interrogative) subject of its verb: the verb is never a subjectless imperative
+        return t.low, "3"
+    if not t.analyses and t.low not in _DETERMINERS and t.low not in _PREPOSITIONS             and t.low not in _INTERJECTIONS and t.low not in _WH_WORDS \
+            and t.low not in _FR_NEGATORS and t.low not in _CONNECTIVES \
+            and t.low not in _TIME_ADVERBS and t.low not in {"que", "qu'", "qui"}:
+        # nominal subject ("maman", "le script"); it never extends across a WH word
+        # or a temporal introducer ("P quand Nadia exécute Q": the subject is "nadia")
+        j = k
+        while j > 0 and not toks[j - 1].analyses and toks[j - 1].low not in (
+                _PREPOSITIONS | _SUBJECT_PRONOUNS | _WH_WORDS | _TEMPORAL_INTRODUCERS | {"ne", "n'"}):
+            j -= 1
+        words = [x.low for x in toks[j:k + 1] if x.low not in _DETERMINERS]
+        return (" ".join(words) or t.low), "3"
+    return None, None
+
+
+def _negated_periphrasis_infinitive(toks: list[_Tok], after: int, subj: str | None,
+                                    marker: tuple[str, ...]) -> int | None:
+    """"Paul ne vient pas de lancer P", "Paul n'est pas en train de lancer P": a negator
+    between the finite verb and "de" / "en train de". The negated periphrasis is not
+    analysed here (its occurrence is not decided); index of its infinitive, which stays
+    content of that governor (never an addressee request), or None."""
+    j = after
+    while j < len(toks) and toks[j].low in {"pas", "plus", "jamais", "rien"}:
+        j += 1
+    if j == after or subj is None or j + len(marker) >= len(toks):
+        return None
+    last = {"de", "d'"} if marker[-1] == "de" else {marker[-1]}
+    if [t.low for t in toks[j:j + len(marker) - 1]] != list(marker[:-1]) \
+            or toks[j + len(marker) - 1].low not in last:
+        return None
+    v = j + len(marker)
+    return v if _is_verb(toks, v) and "INF" in _feats(toks[v]) else None
+
+
+def _build_drafts(toks: list[_Tok], interrogative: bool = False) -> list[_Draft]:
+    drafts: list[_Draft] = []
+    consumed: set[int] = set()
+    k = 0
+    skip = {"ne", "n'", "pas", "plus", "jamais", "rien", "déjà", "deja", "bien", "not",
+            "never", "surtout", "vraiment", "encore", "toujours", "le", "la", "les", "l'",
+            "y", "en", "lui", "leur", "tout"} | _REFLEXIVE_CLITICS | _DISTRIBUTIVE_FLOATS
+    while k < len(toks):
+        if k in consumed or not _is_verb(toks, k):
+            k += 1
+            continue
+        t = toks[k]
+        cls, pred, feats = _cls(t), _pred(t), _feats(t)
+        subj, person = _subject_before(toks, k)
+        # A finite predicate with an established written subject opens its
+        # immediate postverbal slot to an attested nominal object. If the next
+        # token is also a verb homograph, retain its lexical alternatives but
+        # do not promote that occurrence into an independent predicate.
+        # This is local to a syntactically governed slot; it does not suppress
+        # genuine uses such as "Paul marie Alice" or "Il marie Paul".
+        preceding = drafts[-1] if drafts else None
+        if (subj is None and preceding is not None
+                and preceding.verb_form == "FINITE"
+                and preceding.subject is not None
+                and preceding.lex_index == k - 1):
+            try:
+                from brody.linguistic.lexical_corpus import lookup_surface_form
+                from brody.linguistic.lexical_corpus import corpus_identity
+                noun_readings = [row for row in lookup_surface_form(t.low, lang="fr")
+                                 if row.pos in {"noun", "nom", "NOM"}]
+                corpus_ready = corpus_identity().get("status") == "READY"
+            except (OSError, RuntimeError):
+                noun_readings, corpus_ready = [], False
+            if noun_readings and corpus_ready:
+                tok_evidence = {
+                    "rule": "CORPUS_NOMINAL_OBJECT_AFTER_FINITE_PREDICATE",
+                    "status": "SYNTAX_SELECTED",
+                    "span": [t.start, t.end],
+                    "governor_span": [toks[preceding.lex_index].start,
+                                      toks[preceding.lex_index].end],
+                    "subject": preceding.subject,
+                    "noun_evidence": [row.to_dict() for row in noun_readings],
+                    "verbal_alternatives": [
+                        {"lemma": lemma, "features": sorted(features)}
+                        for lemma, features in t.analyses
+                    ],
+                    "semantic_resolution": False,
+                    "verified_fact": False,
+                    "entity_identity_verified": False,
+                }
+                t.nominal_object_evidence = tok_evidence
+                k += 1
+                continue
+        # A corpus homograph after a written determiner is nominal evidence,
+        # not a subjectless command. Preserve the nominal phrase and leave the
+        # remainder to the existing parser without asserting a relative link;
+        # do not manufacture an imperative such as ``lettrer`` from ``Les lettres``.
+        if (subj is None and k > 0 and toks[k - 1].low in _DETERMINERS
+                and not ({'INF', 'PP'} & feats)):
+            try:
+                from brody.linguistic.lexical_corpus import lookup_surface_form
+                nominal_readings = lookup_surface_form(t.low, lang='fr')
+            except (OSError, RuntimeError):
+                nominal_readings = ()
+            if any(row.pos in {'noun', 'nom', 'NOM'} for row in nominal_readings):
+                k += 1
+                continue
+        inverted = False
+        nxt = toks[k + 1] if k + 1 < len(toks) else None
+        epenthetic = nxt is not None and nxt.low == "t'" and nxt.hyphen_before and k + 2 < len(toks) \
+            and toks[k + 2].hyphen_before and toks[k + 2].low in {"il", "elle", "on"}
+        nominal = subj if subj is not None and subj not in _SUBJECT_PRONOUNS             and subj not in {"c'", "ça", "ca", "cela"} else None
+        if epenthetic:
+            # "faudra-t-il": the euphonic "-t-" only marks the inversion (no subject, no content)
+            subj, person, inverted = toks[k + 2].low, "3", True
+            nxt = toks[k + 2]
+        if not epenthetic and nxt is not None and nxt.low in _SUBJECT_PRONOUNS and (
+                nxt.hyphen_before or ("EN" in feats and cls == "modal")):
+            subj, person, inverted = nxt.low, ("2" if nxt.low in _SECOND_PERSON else "1"
+                                               if nxt.low in _FIRST_PERSON else "3"), True
+        if inverted and nominal is not None and person == "3":
+            # complex inversion ("Paul lance-t-il le test ?"): the inverted pronoun only
+            # resumes the nominal subject, which stays the participant
+            subj = nominal
+        after = k + 3 if epenthetic else k + 2 if inverted else k + 1
+
+        # aux avoir/être + participle ; "a failli" + infinitive ; "est en train de"
+        if pred in {"HAVE", "BE"}:
+            familiar_tu = k > 0 and toks[k - 1].low == "t'" and not toks[k - 1].hyphen_before  # "t'as pas à"
+            v = _negated_periphrasis_infinitive(toks, after, subj or ("tu" if familiar_tu else None), ("à",)) \
+                if pred == "HAVE" else None
+            if v is not None:
+                # "Tu n'as pas / rien à lancer P": negated "avoir à" (deontic force held, H16)
+                drafts.append(_Draft(toks[v], v, v, "INFINITIVE", governed="deontic_scope_open"))
+                consumed.update({k, v})
+                k = v + 1
+                continue
+            if pred == "HAVE" and subj is not None and after + 1 < len(toks) and toks[after].low in {"à", "a"} \
+                    and _is_verb(toks, after + 1) and "INF" in _feats(toks[after + 1]) \
+                    and not (k > 0 and toks[k - 1].low in {"ne", "n'"}):
+                # H16 A: "Tu as à lancer P", "Paul a à lancer P": obligation, by the modal channel
+                v = after + 1
+                drafts.append(_Draft(toks[v], v, k, "INFINITIVE", _tense_of(feats),
+                                     modality="OBLIGATION", modal_tok=t, subject=subj,
+                                     subject_person=person, inverted=inverted))
+                consumed.update({k, v})
+                k = v + 1
+                continue
+            if pred == "BE":
+                j = after
+                while j < len(toks) and toks[j].low in {"pas", "plus", "jamais"}:
+                    j += 1
+                negated = j != after or (k > 0 and toks[k - 1].low in {"ne", "n'"})
+                deontic = j + 2 < len(toks) and toks[j].low in {"obligatoire", "nécessaire"} \
+                    and toks[j + 1].low in {"de", "d'"} and _is_verb(toks, j + 2) and "INF" in _feats(toks[j + 2])
+                if deontic and toks[j].low == "obligatoire" and (not negated or interrogative):
+                    # H16 A: "Il est obligatoire de lancer P" is an obligation, by the same channel
+                    # as "il faut" ("Est-il / N'est-il pas obligatoire de lancer P ?": question
+                    # or request, the negated operator never a prohibition)
+                    v = j + 2
+                    drafts.append(_Draft(toks[v], v, k, "INFINITIVE", _tense_of(feats),
+                                         modality="OBLIGATION", modal_tok=t, subject=subj,
+                                         subject_person="impersonal", inverted=inverted))
+                    consumed.update({k, v})
+                    k = v + 1
+                    continue
+                if deontic and negated:
+                    # "Il n'est pas obligatoire / nécessaire de lancer P": NOT_REQUIRED (set with "pas
+                    # besoin de" below); "N'est-il pas nécessaire de lancer P ?" stays held. Never a
+                    # prohibition, never a request
+                    v = j + 2
+                    drafts.append(_Draft(toks[v], v, v, "INFINITIVE", governed="deontic_scope_open"))
+                    consumed.update({k, v})
+                    k = v + 1
+                    continue
+                # "Il est nécessaire de lancer P": necessity is not an obligation (H16 A): held
+                # under its unrecognised governor
+            if pred == "BE":
+                # être là / ici -> presence ; être en train de + inf -> progressive
+                j = after
+                if j < len(toks) and toks[j].low in {"là", "ici", "la", "here"} and (
+                        j + 1 >= len(toks) or toks[j].low != "la" or not toks[j + 1].analyses):
+                    drafts.append(_Draft(t, k, k, "FINITE", _tense_of(feats),
+                                         subject=subj, subject_person=person, inverted=inverted))
+                    consumed.add(k)
+                    k += 1
+                    continue
+                if (j + 2 < len(toks) and toks[j].low == "en" and toks[j + 1].low == "train"
+                        and toks[j + 2].low in {"de", "d'"}):
+                    v = _next_verb(toks, j + 3, skip)
+                    if v is not None:
+                        drafts.append(_Draft(toks[v], v, k, "INFINITIVE", "PROGRESSIVE",
+                                             subject=subj, subject_person=person, modal_tok=t))
+                        consumed.update({k, v})
+                        k = v + 1
+                        continue
+                v = _negated_periphrasis_infinitive(toks, after, subj, ("en", "train", "de"))
+                if v is not None:
+                    drafts.append(_Draft(toks[v], v, v, "INFINITIVE", governed="unknown_governor"))
+                    consumed.update({k, v})
+                    k = v + 1
+                    continue
+            v = _next_verb(toks, after, skip)
+            if v is not None and "PP" in _feats(toks[v]):
+                lex = toks[v]
+                if _pred(lex) == "NEARLY":
+                    w = _next_verb(toks, v + 1, skip)
+                    if w is not None:
+                        drafts.append(_Draft(toks[w], w, k, "INFINITIVE", "AVERTED",
+                                             subject=subj, subject_person=person))
+                        consumed.update({k, v, w})
+                        k = w + 1
+                        continue
+                if _MODALITY.get(_pred(lex)) is not None:
+                    # "a voulu / a pu / a dû / a su / a fallu" + infinitive: one modal chain in
+                    # a compound tense (its occurrence is held, see modal_past_occurrence_open)
+                    w = _next_verb(toks, v + 1, skip)
+                    if w is not None and "INF" in _feats(toks[w]) and "PP" not in _feats(toks[w]):
+                        drafts.append(_Draft(
+                            toks[w], w, k, "INFINITIVE", _COMPOUND_TENSE.get(_tense_of(feats), "PAST"),
+                            modality=_MODALITY[_pred(lex)], modal_tok=lex, subject=subj,
+                            subject_person="impersonal" if _pred(lex) == "NEED" else person,
+                            inverted=inverted, compound_modal=True))
+                        consumed.update({k, v, w})
+                        k = w + 1
+                        continue
+                aux_t = _tense_of(feats)
+                tense = {"PRESENT": "PAST", "PAST": "PLUPERFECT", "FUTURE": "FUTURE",
+                         "CONDITIONAL": "CONDITIONAL"}.get(aux_t, "PAST")
+                drafts.append(_Draft(lex, v, k, "PARTICIPLE", tense,
+                                     subject=subj, subject_person=person, inverted=inverted))
+                consumed.update({k, v})
+                k = v + 1
+                continue
+            if pred == "HAVE" and nxt is not None and nxt.low == "peur":
+                drafts.append(_Draft(t, k, k, "FINITE", _tense_of(feats), subject=subj,
+                                     subject_person=person))
+                consumed.add(k)
+                k += 1
+                continue
+            if pred == "HAVE":
+                j=after
+                while j<len(toks) and toks[j].low in (_ADVERBS_SKIPPABLE | {"ne","n'"})-{"rien"}:j+=1
+                nominal,_=_np_from(toks,j)
+                if nominal is not None and nominal.kind=="NP" and nominal.span is not None:
+                    from brody.linguistic.lexical_corpus import lookup_surface_form
+                    from brody.linguistic.lexical_corpus import corpus_identity
+                    words=nominal.head.split()
+                    try:evidence=[lookup_surface_form(w,lang="fr") for w in words]
+                    except (OSError,RuntimeError):evidence=[]
+                    noun=lambda rows:any(r.pos in {"noun","NOM","nom"} for r in rows)
+                    nominal_word=lambda rows:any(r.pos in {"noun","NOM","nom","adjective","adj","ADJ"} for r in rows)
+                    determined=j<len(toks) and toks[j].low in _DETERMINERS
+                    negated_de=(j>=len(toks) or toks[j].low not in {"de","d'"}
+                                or any(x.low in _FR_NEGATORS for x in toks[max(0,k-2):j]))
+                    if (determined and negated_de and evidence and all(nominal_word(rows) for rows in evidence)
+                            and any(noun(rows) for rows in evidence) and corpus_identity().get("status")=="READY"):
+                        drafts.append(_Draft(t,k,k,"FINITE",_tense_of(feats),subject=subj,subject_person=person,inverted=inverted))
+            consumed.add(k)
+            k += 1
+            continue
+
+        # aller + inf (near future / imperative "va lancer"), venir de + inf
+        if pred == "GO":
+            v = _next_verb(toks, after, skip)
+            if v is not None and "INF" in _feats(toks[v]):
+                drafts.append(_Draft(toks[v], v, k, "INFINITIVE",
+                                     "NEAR_FUTURE" if subj else "NONE",
+                                     subject=subj, subject_person=person, modal_tok=t))
+                consumed.update({k, v})
+                k = v + 1
+                continue
+            consumed.add(k)
+            k += 1
+            continue
+        if pred == "COME":
+            if after < len(toks) and toks[after].low in {"de", "d'"}:
+                v = _next_verb(toks, after + 1, skip)
+                if v is not None:
+                    drafts.append(_Draft(toks[v], v, k, "INFINITIVE", "RECENT_PAST",
+                                         subject=subj, subject_person=person, modal_tok=t))
+                    consumed.update({k, v})
+                    k = v + 1
+                    continue
+            v = _negated_periphrasis_infinitive(toks, after, subj, ("de",))
+            if v is not None:
+                drafts.append(_Draft(toks[v], v, v, "INFINITIVE", governed="unknown_governor"))
+                consumed.update({k, v})
+                k = v + 1
+                continue
+            v = _next_verb(toks, after, skip)
+            if v is not None and person == "2" and "INF" in _feats(toks[v]) and "PP" not in _feats(toks[v])                     and interrogative:
+                # H09: "Tu viens lancer P ?": question or request about the addressee's action;
+                # the subject is kept, never a bare injunction
+                drafts.append(_Draft(toks[v], v, k, "INFINITIVE", "PRESENT", subject=subj,
+                                     subject_person=person, modal_tok=t))
+                consumed.update({k, v})
+                k = v + 1
+                continue
+            if v is not None and person == "2" and "INF" in _feats(toks[v]) and "PP" not in _feats(toks[v]):
+                # "Tu viens lancer P.": venir + infinitive has no construction here (statement or
+                # directive): the subject "tu" is kept (never dropped into a bare injunction), the
+                # content stays under that governor, its possible request exposed, frame open
+                d = _Draft(toks[v], v, v, "INFINITIVE", governed="unknown_governor",
+                           subject=subj, subject_person=person)
+                d.possible_request = True
+                drafts.append(d)
+                consumed.update({k, v})
+                k = v + 1
+                continue
+            if v is not None and person in {"1", "3"} and "INF" in _feats(toks[v]) and "PP" not in _feats(toks[v]):
+                # "Paul (ne) vient (pas) lancer P": venir + infinitive has no construction here;
+                # the infinitive is content of that unrecognised governor, never an injunction
+                drafts.append(_Draft(toks[v], v, v, "INFINITIVE", governed="unknown_governor"))
+                consumed.update({k, v})
+                k = v + 1
+                continue
+            if subj is not None and v is None and feats.intersection(
+                    {"PRES", "IMPF", "FUT", "COND", "PAST_SIMPLE", "PST"}):
+                # A bare finite venir is lexical COME, not a recent-past periphrasis.
+                # The corpus supplies its finite paradigm; preserve the written subject
+                # so structural agreement can compare the attested person/number cell.
+                drafts.append(_Draft(t, k, k, "FINITE", _tense_of(feats),
+                                     subject=subj, subject_person=person, inverted=inverted))
+                consumed.add(k)
+                k += 1
+                continue
+            consumed.add(k)
+            k += 1
+            continue
+
+        # modal + infinitive
+        if cls == "modal":
+            v = _next_verb(toks, after, skip)
+            form = "INFINITIVE"
+            if v is not None and _pred(toks[v]) == "BE":
+                attribute=_bounded_copular_attribute(toks,v)
+                if attribute is not None:
+                    # Descriptive construction only. An unsupported copular
+                    # assertion stays explicit unanalysed content downstream,
+                    # never a presence event or a homographic verb request.
+                    consumed.update(range(k,attribute+1))
+                    k=attribute+1
+                    continue
+                # passive under modal: "doit être lancé"
+                w = _next_verb(toks, v + 1, skip)
+                if w is not None and "PP" in _feats(toks[w]):
+                    consumed.add(v)
+                    v, form = w, "PARTICIPLE"
+            if v is not None and ("INF" in _feats(toks[v]) or form == "PARTICIPLE"):
+                # "veuillez" + inf: polite directive operator, not a desire modality
+                polite = pred == "WANT" and "IMP" in feats and subj is None
+                d = _Draft(toks[v], v, k, form, _tense_of(feats),
+                           modality=None if polite else _MODALITY.get(pred), modal_tok=t,
+                           politeness=polite or "COND" in feats or t.low == "could",
+                           subject=subj, subject_person=person, inverted=inverted,
+                           directive=polite)
+                if pred == "NEED":
+                    d.subject_person = "impersonal"
+                drafts.append(d)
+                consumed.update({k, v})
+                k = v + 1
+                continue
+            drafts.append(_Draft(t, k, k, "FINITE", _tense_of(feats), subject=subj,
+                                 subject_person=person, politeness="COND" in feats,
+                                 inverted=inverted))
+            consumed.add(k)
+            k += 1
+            continue
+
+        # EN "do" as auxiliary: do not run / don't run
+        if pred == "DO" and "EN" in feats and nxt is not None and nxt.low in _EN_NEGATORS:
+            consumed.add(k)
+            k += 1
+            continue
+
+        form, unresolved_subject = "FINITE", False
+        prev = toks[k - 1] if k > 0 else None
+        if "INF" in feats and (not ({"PRES", "IMP", "PP"} & feats)
+                               or (prev is not None and prev.low in {"de", "d'", "à", "to", "pas", "rien"})):
+            form = "INFINITIVE"
+        elif "PPR" in feats and not ({"PRES", "IMP", "INF"} & feats):
+            form = "GERUND"
+        elif subj is None and "PRES" in feats and not ({"IMP", "EN", "P1P", "P2P"} & feats) \
+                and has_imperative_paradigm(_lemma(t)):
+            # no subject is not a proof of imperative: "Exécutent Q.", "Font Q." have no
+            # imperative reading in a known paradigm; the subject stays unresolved (a 1st /
+            # 2nd plural present is always a possible imperative: "Disons Q.")
+            form, unresolved_subject = "FINITE", True
+        elif subj is None and ({"IMP", "PRES", "INF"} & feats):
+            form = "IMPERATIVE"
+        elif subj is None and "PP" in feats:
+            form = "PARTICIPLE"
+        drafts.append(_Draft(t, k, k, form, "NONE" if form in {"IMPERATIVE", "INFINITIVE"}
+                             else _tense_of(feats), subject=subj, subject_person=person,
+                             inverted=inverted,
+                             governed="subject_unresolved" if unresolved_subject else None))
+        consumed.add(k)
+        k += 1
+    return drafts
+
+
+# ── objects ──────────────────────────────────────────────────────────────
+def _np_from(toks: list[_Tok], j: int, *, _nominal_depth: int = 0) -> tuple[Argument | None, int]:
+    """Parse one noun phrase starting at j. Returns (argument, next index)."""
+    if j >= len(toks):
+        return None, j
+    t = toks[j]
+    # Oral constituent negation before a written PP/NP is not the bare noun
+    # "pas" (a step). A determined "le/un pas" still uses the ordinary NP path.
+    if (t.low in _ORAL_NEGATORS and j+1<len(toks)
+            and toks[j+1].low in (_PREPOSITIONS | _DETERMINERS)):
+        return None, j
+    # D5-N3: a quantifier owns its licensed nominal complement ("chacun des / de ces tests",
+    # "un des tests", "tous les tests"): one complete argument, never truncated
+    nxt = toks[j + 1].low if j + 1 < len(toks) else None
+    inner_at = None
+    if t.low in _PARTITIVE_QUANTIFIERS and nxt in {"des", "du"}:
+        inner_at = j + 1
+    elif t.low in _PARTITIVE_QUANTIFIERS and nxt in {"de", "d'"} and j + 2 < len(toks)             and toks[j + 2].low in _DETERMINERS:
+        inner_at = j + 2
+    elif t.low in _TOTALITY_QUANTIFIERS and nxt in _DETERMINERS and nxt not in {"de", "d'", "des", "du", "un", "une"}:
+        inner_at = j + 1
+    if inner_at is not None:
+        inner, nj = _np_from(toks, inner_at)
+        if inner is not None and inner.kind == "NP":
+            text = " ".join(x.low for x in toks[j:nj])
+            return Argument(text, inner.head, "NP", inner.reference, span=(t.start, toks[nj - 1].end)), nj
+    # D5-N6: "tout" closing its phrase is the pronoun object ("lance tout"); "tout seul" stays
+    # manner (N7), "tout le test" is the N3 quantified NP above
+    if t.low == "tout" and (nxt is None or toks[j + 1].is_punct or nxt in _CONNECTIVES
+                            or nxt in _PREPOSITIONS or nxt in _TIME_ADVERBS):
+        return Argument("tout", "tout", "NP", "LITERAL", span=(t.start, t.end)), j + 1
+    if t.low in _WH_WORDS or t.low in _REFLEXIVE_CLITICS or t.low in _MANNER_ADVERBS:
+        return None, j
+    if t.low in _DEMONSTRATIVE_PRONOUNS:
+        end = j + 1
+        text = t.low
+        if end < len(toks) and toks[end].hyphen_before and toks[end].low in {"ci", "là", "la"}:
+            text += "-" + toks[end].low
+            end += 1
+        return Argument(text, text, "DEMONSTRATIVE", "UNRESOLVED", span=(t.start, toks[end - 1].end)), end
+    if t.low in _PRONOUN_OBJECTS_EN:
+        return Argument(t.low, t.low, "PRONOUN", "UNRESOLVED", span=(t.start, t.end)), j + 1
+    if t.low == "rien" or t.low == "personne":
+        return Argument(t.low, "*", "NEGATIVE_QUANTIFIER", "LITERAL", span=(t.start, t.end)), j + 1
+    det = None
+    if t.low in _DETERMINERS:
+        det = t.low
+        j += 1
+    # Compositional nominal prefix: de + article/possessive + nominal.
+    # LA is also an attested musical noun, but not the head when a written
+    # article introduces another nominal here. A final "le la" stays nominal.
+    if (det in {"de","d'"} and j+1<len(toks)
+            and toks[j].low in _DETERMINERS-{"de","d'","du","des","au","aux"}
+            and not toks[j+1].is_punct and not _is_verb(toks,j+1)
+            and toks[j+1].low not in _PREPOSITIONS | _FR_NEGATORS | _SUBJECT_PRONOUNS):
+        j += 1
+    words = []
+    start = t.start
+    end_tok = t
+    while j < len(toks):
+        w = toks[j]
+        nominal_closed_homograph = False
+        licensed_noun_verb_homograph = False
+        if det is not None and not words and w.low in _DETERMINERS:
+            try:
+                from brody.linguistic.lexical_corpus import lookup_surface_form
+                from brody.linguistic.lexical_corpus import corpus_identity
+                nominal_closed_homograph = (corpus_identity().get("status") == "READY"
+                    and any(a.pos in {"noun", "nom", "NOM"} for a in lookup_surface_form(w.low, lang="fr")))
+            except (OSError, RuntimeError):
+                pass
+        if det is not None and not words and _is_verb(toks, j):
+            try:
+                from brody.linguistic.lexical_corpus import lookup_surface_form
+                from brody.linguistic.lexical_corpus import corpus_identity
+                licensed_noun_verb_homograph = (corpus_identity().get("status") == "READY"
+                    and any(a.pos in {"noun", "nom", "NOM"} for a in lookup_surface_form(w.low, lang="fr")))
+            except (OSError, RuntimeError):
+                licensed_noun_verb_homograph = False
+        if (w.low in _PREPOSITIONS or w.low in _TIME_ADVERBS or w.low in _CONNECTIVES
+                or w.low in {"que", "qu'", "qui", "ne", "n'"} or w.low in _WH_WORDS
+                or (words and (w.low in _FR_NEGATORS or w.low in _EN_NEGATORS))
+                or (w.low in _DETERMINERS and not nominal_closed_homograph)
+                or w.low in _SUBJECT_PRONOUNS or w.low in _RESTRICTION_ADVERBS
+                or w.is_punct or (_is_verb(toks, j) and not licensed_noun_verb_homograph)
+                or (words and w.low in _MANNER_ADVERBS)  # D5-N7: a modifier never extends the object
+                or (w.low == "s'" and _politeness_formula(toks, j))  # "le test s'il te plaît"
+                or w.low in _OBJECT_BOUNDARY_PREPOSITIONS
+                or (words and w.low=="comme" and j+1<len(toks) and toks[j+1].low in _DETERMINERS)):
+            break
+        words.append(w.low)
+        end_tok = w
+        j += 1
+    if det is None and not words:
+        return None, j
+    if not words:
+        # bare "le" / "la" / "les" / "l'" with nothing nominal after: pronoun
+        if det in {"le", "la", "les", "l'"}:
+            return Argument(det, det, "PRONOUN", "UNRESOLVED", span=(t.start, t.end)), j
+        return None, j
+    head = " ".join(words)
+    if det in _DEMONSTRATIVE_DET:
+        ref, kind = "DEICTIC", "NP"
+    elif det in {"aucun", "aucune"}:
+        ref, kind = "LITERAL", "NEGATIVE_QUANTIFIER"
+    elif det in _DEFINITE:
+        ref, kind = "PRESUPPOSED", "NP"
+    else:
+        ref, kind = "LITERAL", "NP"
+    text = " ".join(x.low for x in toks if start <= x.start and x.end <= end_tok.end)
+    argument=Argument(text, head, kind, ref, span=(start,end_tok.end))
+    # Extend the existing NP, preserving its external head. This licenses a
+    # syntactic nominal complement only, not possession/source/world truth.
+    # Corpus-unknown material stays in the existing coverage fallback.
+    from brody.linguistic.lexical_corpus import lookup_surface_form
+    def nominal_evidence(value):
+        readings=[lookup_surface_form(w,lang='fr') for w in value.split()]
+        return (bool(readings) and all(any(r.pos in {'noun','NOM','nom','adjective','adj','ADJ'} for r in rs)
+                                      for rs in readings)
+                and any(r.pos in {'noun','NOM','nom'} for rs in readings for r in rs))
+    if kind=='NP' and _nominal_depth<8:
+        try:
+            licensed=nominal_evidence(head)
+        except (OSError,RuntimeError):
+            licensed=False
+        while licensed and j<len(toks) and toks[j].low in {'de',"d'",'du','des'}:
+            child_at=j+1 if toks[j].low in {'de',"d'"} else j
+            if child_at>=len(toks) or _is_verb(toks,child_at):break
+            # A bare capitalized head may denote a person/entity. Source case
+            # is evidence of ambiguity, never a proof of a resolved proper name.
+            if toks[child_at].low not in _DETERMINERS and (not toks[child_at].raw_form
+                    or toks[child_at].raw_form[0].isupper()):break
+            child,nj=_np_from(toks,child_at,_nominal_depth=_nominal_depth+1)
+            try:
+                child_known=child is not None and child.kind=='NP' and nominal_evidence(child.head)
+            except (OSError,RuntimeError):
+                child_known=False
+            if not child_known or nj<=child_at:break
+            argument=replace(argument,text=' '.join(x.low for x in toks if start<=x.start and x.end<=child.span[1]),
+                             span=(start,child.span[1]))
+            j=nj
+    return argument,j
+
+
+def _floating_each(toks: list[_Tok], d: "_Draft", u: PredicateUnit) -> tuple[_Tok | None, list[Argument] | None]:
+    """A floating "chacun / chacune" of the subject: inside the verb chain ("ont chacun
+    lancé"), or right after the finite verb opening the object ("lancent chacun P", never
+    the partitive "chacun des tests"). Returns (token, objects re-read after it or None)."""
+    inner = next((t for t in toks[d.head_index + 1:d.lex_index] if t.low in _DISTRIBUTIVE_FLOATS), None)
+    if inner is not None:
+        return inner, None
+    post = d.lex_index + 1
+    if not (post + 1 < len(toks) and toks[post].low in _DISTRIBUTIVE_FLOATS
+            and toks[post + 1].low not in {"de", "d'", "des", "du"} and not toks[post + 1].is_punct
+            and u.objects and u.objects[0].span is not None and u.objects[0].span[0] == toks[post].start):
+        return None, None
+    args, j = [], post + 1
+    while j < len(toks):
+        arg, j = _np_from(toks, j)
+        if arg is None:
+            break
+        args.append(arg)
+        if j < len(toks) and toks[j].low in {"et", "ou", ","}:
+            j += 1
+            continue
+        break
+    return (toks[post], args) if args else (None, None)
+
+
+def _objects_for(toks: list[_Tok], d: _Draft, clause: _Clause) -> list[Argument]:
+    args: list[Argument] = []
+    k = d.lex_index
+    # clitic objects before the chain head ("ne l'exécute", "tu le lances")
+    j = d.head_index - 1
+    while j >= 0 and toks[j].low in (_OBJECT_CLITICS | _REFLEXIVE_CLITICS | {"ne", "n'", "rien"}):
+        if toks[j].low in {"le", "la", "les", "l'"}:
+            args.append(Argument(toks[j].low, toks[j].low, "PRONOUN", "UNRESOLVED",
+                                 span=(toks[j].start, toks[j].end)))
+        if toks[j].low == "rien":
+            args.append(Argument("rien", "*", "NEGATIVE_QUANTIFIER", "LITERAL",
+                                 span=(toks[j].start, toks[j].end)))
+        j -= 1
+    # clitic between modal and infinitive ("tu peux le lancer")
+    for m in range(d.head_index + 1, k):
+        if toks[m].low in {"le", "la", "les", "l'"}:
+            args.append(Argument(toks[m].low, toks[m].low, "PRONOUN", "UNRESOLVED",
+                                 span=(toks[m].start, toks[m].end)))
+        elif toks[m].low == "tout":
+            # D5-N6: preposed "tout" inside the chain ("a tout lancé", "peut tout lancer")
+            args.append(Argument("tout", "tout", "NP", "LITERAL", span=(toks[m].start, toks[m].end)))
+    j = k + 1
+    if d.inverted and d.head_index == k:
+        j += 1
+        if j < len(toks) and toks[j - 1].low == "t'" and toks[j].hyphen_before:
+            j += 1  # euphonic "-t-" + pronoun ("lance-t-il le test"): the object follows both
+    # hyphenated clitic: "exécute-le", "fais-le"
+    if j < len(toks) and toks[j].hyphen_before and toks[j].low in {"le", "la", "les", "moi", "lui"}:
+        if toks[j].low in {"le", "la", "les"}:
+            args.append(Argument(toks[j].low, toks[j].low, "PRONOUN", "UNRESOLVED",
+                                 span=(toks[j].start, toks[j].end)))
+        j += 1
+    # restriction "que" ("ne lance que les tests")
+    if clause.restriction_at is not None and clause.restriction_at > k:
+        j = clause.restriction_at + 1
+    while j < len(toks) and (toks[j].low in (_ADVERBS_SKIPPABLE | _RESTRICTION_ADVERBS | {"ni"}) - {"rien"}
+                             or (toks[j].low in _MANNER_ADVERBS - {"tout"}
+                                 and j + 1 < len(toks) and not toks[j + 1].is_punct)):
+        j += 1  # D5-N7: "lance vite P": the modifier is kept apart (reported), P stays the object
+    # coordinated NPs: "le script et les tests", "ni le script ni les tests"
+    while j < len(toks):
+        arg, nj = _np_from(toks, j)
+        if arg is None:
+            break
+        args.append(arg)
+        j = nj
+        if j < len(toks) and toks[j].low in {"et", "ni", "ou", "and", "or", ","}:
+            j += 1
+            continue
+        break
+    return args
+
+
+# ── negation / restriction / expletive ne ────────────────────────────────
+def _polarity(toks: list[_Tok], d: _Draft, clause: _Clause, all_drafts: list[_Draft]) -> dict:
+    out = {"polarity": "positive", "negator": None, "negation_confirmed": False,
+           "ne_omitted": False, "ne_expletive": False, "restriction": None,
+           "confidence": 1.0}
+    lo, hi = d.head_index, d.lex_index
+    lows = [t.low for t in toks]
+
+    if clause.conn in {"sans", "sans_que"} and d is all_drafts[0]:
+        out.update(polarity="negative", negator="sans" if clause.conn == "sans" else "sans que",
+                   negation_confirmed=True)
+        return out
+
+    # verbal "ne ... ni V1 ni V2": the member directly after "ni" is negated by
+    # the shared ni coordination (see _mark_verbal_ni), not by another member.
+    if clause.ni_head is not None and lo > 0 and lows[lo - 1] == "ni":
+        out.update(polarity="negative", negator="ni", negation_confirmed=True)
+        return out
+
+    # EN negation: do not / don't / never / not before the chain head.
+    for j in range(max(0, lo - 3), lo):
+        if lows[j] in _EN_NEGATORS:
+            out.update(polarity="negative", negator=lows[j], negation_confirmed=True)
+            return out
+
+    # Scope (OQLF): "ne" precedes the finite verb (clitics in between) and the
+    # negator follows it: ne [clitics] V_fin NEG. Before an infinitive both
+    # elements precede it: ne NEG [clitics] V_inf. A "ne ... NEG" pair that
+    # frames ANOTHER word (even a verb unknown to the lexicon, e.g.
+    # "n'oublie pas de lancer") does not negate this chain.
+    prev_hi = max([x.lex_index for x in all_drafts if x.lex_index < lo] or [-1])
+    next_lo = min([x.head_index for x in all_drafts if x.head_index > hi] or [len(toks)])
+    clitics = _OBJECT_CLITICS | _REFLEXIVE_CLITICS
+    ne_idx = [j for j in range(prev_hi + 1, hi) if lows[j] in {"ne", "n'"}]
+    if ne_idx:
+        ne = ne_idx[-1]
+        if clause.restriction == "NOT_ONLY":
+            out["restriction"] = "NOT_ONLY"
+            return out
+        framed = ne < lo and all(lows[j] in clitics for j in range(ne + 1, lo))
+        if framed:
+            # ne [clitics] V_fin ... NEG  (negator after the chain head)
+            neg = [j for j in range(lo + 1, next_lo) if lows[j] in _FR_NEGATORS]
+            if neg:
+                out.update(polarity="negative", negator=lows[neg[0]], negation_confirmed=True)
+                return out
+        # ne NEG [clitics] V_inf  (both precede the lexical infinitive)
+        if ne + 1 < hi and lows[ne + 1] in _FR_NEGATORS and all(
+                lows[j] in clitics | _FR_NEGATORS or j == lo for j in range(ne + 2, hi)):
+            out.update(polarity="negative", negator=lows[ne + 1], negation_confirmed=True)
+            return out
+        if framed:
+            if clause.restriction == "ONLY":
+                out["restriction"] = "ONLY"
+                return out
+            if clause.conn in {"que", "avant_que", "a_moins_que", "comparative"}:
+                out["ne_expletive"] = True
+                return out
+            out.update(polarity="negative", negator="ne", negation_confirmed=False, confidence=0.5)
+            return out
+        # The ne ... NEG pair frames another (possibly unknown) predicate.
+        out["governor_negated"] = True
+        return out
+    # oral negation of a chain head: "tu peux pas lancer P" (never dropped for lack of "ne")
+    k = _oral_head_negator(toks, d)
+    if k is not None:
+        out.update(polarity="negative", negator=lows[k], ne_omitted=True,
+                   negation_confirmed=False, confidence=0.7)
+        return out
+    # oral negation: negator right after the verb (or its hyphenated clitic)
+    j = hi + 1
+    while j < len(lows) and toks[j].hyphen_before and lows[j] in {"le", "la", "les", "moi", "lui"}:
+        j += 1
+    if j < len(lows) and lows[j] in _ORAL_NEGATORS and not (
+            j + 1 < len(lows) and lows[j] == "pas" and lows[j + 1] in {"à", "a", "besoin"}):
+        out.update(polarity="negative", negator=lows[j], ne_omitted=True,
+                   negation_confirmed=False, confidence=0.7)
+        return out
+    if any(lows[j] in _RESTRICTION_ADVERBS for j in range(prev_hi + 1, min(next_lo, len(lows)))):
+        out["restriction"] = "ONLY"
+    return out
+
+
+# ── main entry point ─────────────────────────────────────────────────────
+def parse_utterance(raw: str, *, language: str = "fr") -> UtteranceFrame:
+    language = str(language or "fr").lower()
+    if language not in {"fr", "en"}:
+        raise ValueError(f"unsupported language: {language}")
+    raw = raw if isinstance(raw, str) else str(raw)
+    if language == "en":
+        from brody.linguistic.english_grammar import parse_english_utterance
+        return parse_english_utterance(raw)
+    toks, disfluencies, ortho = _tokenize(raw)
+    normalized = " ".join(t.low for t in toks)
+    clauses, interrogative = _segment(toks)
+    clauses = _split_relative_main(clauses, raw)     # R1-R5: relative / main boundary
+    _mark_verbal_ni(clauses)
+    # "Si P et Q, R" / "si P et que Q" / "si P et si Q": one conjunctive protasis.
+    # A bare "et Q" joins only a sentence-initial protasis ("R si P et Q" stays open), or
+    # (H11 option C) a postposed one whose modal chain it morphologically continues
+    # ("R si Paul veut lancer P et exécuter Q"); never by proximity.
+    for k in range(1, len(clauses)):
+        prev, clause = clauses[k - 1], clauses[k]
+        if prev.conn != "si" or clause.boundary is not None or not clause.conn_toks \
+                or clause.conn_toks[0].low not in {"et", "ou"}:
+            continue
+        if _continues_prep_chain(prev, clause):
+            # N4: "Si Paul apprend à tester Q et à lancer R, ...": the member continues the
+            # protasis' prep-governed chain (shared below), never a protasis predicate of its own
+            continue
+        head = prev.protasis_head or prev
+        hi = next(j for j, c in enumerate(clauses) if c is head)
+        preposed = hi == 0 or head.boundary in {".", "!", "?", ";", ":"}
+        # R2: "Si P ou Q, R": a preposed protasis joins its "ou" member too (one OR group);
+        # never mixed with "et" (precedence not written); a postposed "R si P ou Q" stays open
+        # A preposed protasis mixing "et" and "ou" joins every member too (its content is
+        # protasis content, never a root claim nor a request); the grouping is never chosen
+        # (named at relation time, no group, no CONDITIONS by an invented precedence)
+        joined = {c.conn_toks[0].low for c in clauses if c.protasis_head is head and c is not head and c.conn_toks}
+        if clause.conn_toks[0].low == "ou":
+            if clause.conn == "ou" and preposed:
+                clause.conn, clause.protasis_head, head.protasis_head = "si", head, head
+            continue
+        if "ou" in joined:
+            if clause.conn == "et" and preposed:
+                clause.conn, clause.protasis_head, head.protasis_head = "si", head, head
+            continue
+        if clause.conn == "si" or (clause.conn == "et" and (preposed or _continues_protasis_modal(prev, clause))):
+            clause.conn, clause.protasis_head, head.protasis_head = "si", head, head
+    # "V que P et Q": Q coordinates inside the complement or with its host.
+    # "V que P parce que Q" / "V que P donc Q": the cause / consequence may bear on P
+    # (inside the complement) or on V; within one sentence it is never bound to the
+    # nearest host. "P quand Q et R": R may continue Q or P (never the nearest either)
+    for prev, clause in zip(clauses, clauses[1:]):
+        causal = clause.conn in {"car", "donc"} and clause.boundary not in {".", "!", "?", ";"}
+        if (clause.conn in {"et", "ou"} or causal) and (_is_complement(prev) or prev.evidential is not None
+                                                        or prev.conn in {"quand", "wh"}):
+            clause.attachment_ambiguous = True
+    # "R si P et Q": after a postposed protasis Q may continue the protasis or the main
+    # clause (held, H11); it is never attached by proximity (no CONDITIONS to it, no
+    # sharing, no request): kept and named, and the protasis conditions its own host R
+    for k in range(2, len(clauses)):
+        prev, clause = clauses[k - 1], clauses[k]
+        if (prev.after_postposed_protasis
+                or ((prev.conn in _POSTPOSED_ATTACH_CONNS or prev.postposed_subordinate)
+                    and prev.protasis_head is None and prev.boundary in {None, ","})) \
+                and clause.boundary in {None, ","} \
+                and (clause.conn in {"et", "ou", "puis", "mais"} or (clause.conn is None and clause.boundary == ",")):
+            clause.attachment_ambiguous = clause.after_postposed_protasis = True
+    # N7 / N7b: a verb coordinated right after a subject "qui" relative ("qui teste P et
+    # exécute Q") is attached by morphology only (H11 option C), never by proximity:
+    # - the relative is on the sentence-initial NP (main predicate later), or the form can only
+    #   be a 3rd person ("et a exécuté Q", "exécutent"), or the host cannot coordinate a finite
+    #   imperative (question / declarative host): it continues the relative, coordinated with
+    #   the relative's predicate (same antecedent), never a root request;
+    # - the form can only be an imperative ("et exécutez Q"): it is the host's main directive;
+    # - 3sg / imperative homograph under an imperative host ("Lance le script qui teste P et
+    #   exécute Q"): attachment open and named, its possible request exposed fail-closed
+    #   (never a definitive REQUESTED, never silently dropped).
+    subject_np = _bare_noun_phrase(clauses[0].toks) if clauses else False
+    subject_np = subject_np and not any(_is_verb(clauses[0].toks, j) for j in range(len(clauses[0].toks)))
+    host_imperative = bool(clauses and clauses[0].toks and clauses[0].conn is None
+                           and _is_verb(clauses[0].toks, 0) and "IMP" in _feats(clauses[0].toks[0])
+                           and not interrogative)
+    for k in range(2, len(clauses)):
+        prev, clause = clauses[k - 1], clauses[k]
+        # (R2: the same H11 option C contract for "que" relatives)
+        rel_qui = (prev.conn == "rel" and prev.conn_toks and prev.conn_toks[-1].low in {"qui", "que", "qu'"}) \
+            or prev.rel_member
+        if not rel_qui or clause.conn not in {"et", "ou", "puis"} or clause.boundary is not None \
+                or not clause.toks or not _is_verb(clause.toks, 0):
+            continue
+        f, first = _feats(clause.toks[0]), clause.toks[0].low
+        third = bool({"P3S", "P3P"} & f) or bool(_AUX_PERSON.get(first, set()) & {"P3S", "P3P"})
+        imp_only = "IMP" in f and not third
+        on_subject = subject_np and all(c.conn == "rel" or c.rel_member for c in clauses[1:k])
+        host = next((c for c in reversed(clauses[:k - 1]) if c.conn != "rel" and not c.rel_member), None)
+        hverbs = [t for j, t in enumerate(host.toks) if _is_verb(host.toks, j)] if host is not None else []
+        host_infinitive = bool(hverbs) and "INF" in _feats(hverbs[-1]) and not ({"PRES", "IMP"} & _feats(hverbs[-1]))
+        host_imp = host is clauses[0] and host_imperative
+        if imp_only and not on_subject:
+            continue                                   # "et exécutez Q": the host's directive
+        if on_subject or host_infinitive or (host_imp and "IMP" not in f):
+            # only the relative can host it ("Peux-tu lancer le script qui teste P et exécute Q ?",
+            # "Lance le script qui teste P et a exécuté Q")
+            clause.rel_member, clause.rel_sibling = True, prev
+            clause.embedding_parent = prev.embedding_parent
+            clause.conn = "rel"
+        else:
+            # relative or host continuation: open, named; a possible directive only under an
+            # imperative host
+            clause.attachment_ambiguous = True
+            clause.rel_member_possible_request = host_imp
+    if any(t.hyphen_before and t.low in _SUBJECT_PRONOUNS for t in toks):
+        interrogative = True
+
+    units: list[PredicateUnit] = []
+    relations: list[LatticeRelation] = []
+    coordinations: list[CoordinationRef] = []
+    detached_sources: list[str] = []  # S12, merged into missing below
+    ambiguities: list[str] = []
+    lost_governors: list[tuple[tuple[int, int], str]] = []  # (governor span, governed unit)
+
+    def _keep_governor_material(clause: _Clause, d: _Draft, uid: str) -> None:
+        # "la mémoire sert à parler", "qui te sert à parler": the material of an unrecognised
+        # prepositional governor (its subject, clitics, verb, preposition) is kept, never dropped
+        material = [t for t in clause.toks[:d.head_index]
+                    if not t.is_punct and t.low not in _RELATIVE_PRONOUNS and t.low not in _CONNECTIVES]
+        if material:
+            lost_governors.append(((material[0].start, material[-1].end), uid))
+    deixis = [t.low for t in toks if t.low in _DEIXIS and not t.hyphen_before]
+    counter = 0
+
+    for ci, clause in enumerate(clauses):
+        drafts = _build_drafts(clause.toks, interrogative)
+        # A nominal/elliptical comparison ("mieux que les employés") must not
+        # turn a noun/participle homograph into an asserted event. Preserve the
+        # entire standard as open content; this does not choose its reading.
+        standard = [t for t in clause.toks if not t.is_punct]
+        if (clause.conn == "comparative" and standard
+                and not any(d.verb_form == "FINITE" or (d.head_index < d.lex_index and _feats(clause.toks[d.head_index]) & {"PRES", "IMPF", "FUT", "COND", "PAST_SIMPLE", "SUBJ", "IMP"}) for d in drafts)):
+            start = clause.conn_toks[0].start if clause.conn_toks else standard[0].start
+            detached_sources.append(f"{UNANALYZED_PREDICATIVE_CONTENT}:{start}-{standard[-1].end}"
+                                    ":comparative_nominal_or_ellipsis")
+            continue
+        if clause.main_subject is not None and drafts:
+            # R1-R5: the main predicate after a relative: its subject is the antecedent
+            d0 = min(drafts, key=lambda d: d.head_index)
+            if d0.subject is None and d0.head_index == 0:
+                d0.subject, d0.subject_person = clause.main_subject, "3"
+                if d0.verb_form == "IMPERATIVE":
+                    d0.verb_form, d0.tense = "FINITE", _tense_of(_feats(d0.lex))
+                d0.governed = None
+        if clause.conn == "rel" and ci > 0 and not clauses[ci - 1].units \
+                and _bare_noun_phrase(clauses[ci - 1].toks):
+            # N6: "Le script qui sert à tester Q sert aussi à arrêter S": after the relative's own
+            # predicate, a second finite verb is the main predicate of the antecedent; its subject
+            # is the antecedent NP, never the relative's object (structural, no nearest NP)
+            ante = " ".join(t.low for t in clauses[ci - 1].toks if t.low not in _DETERMINERS)
+            finite = [d for d in drafts if d.verb_form == "FINITE" and d.head_index > 0]
+            first = min((d.head_index for d in drafts), default=None)   # the relative's own verb
+            for d in finite:
+                if first is not None and d.head_index > first and d.subject is not None \
+                        and d.subject != ante and d.subject_person == "3":
+                    d.subject = ante
+        if clause.unresolved_governor is not None:
+            drafts.append(_unresolved_governor_draft(clause.toks, clause.unresolved_governor))
+        _share_auxiliary(clauses, ci, drafts)
+        if clause.after_postposed_protasis and drafts and _main_imperative_only(clauses, ci, drafts[0]):
+            # "Lance R si tu veux lancer P et exécute Q": "exécute" cannot continue a protasis
+            # whose subject it does not agree with; its only reading is the main imperative
+            clause.attachment_ambiguous = clause.after_postposed_protasis = False
+            clause.main_after_protasis = True
+        for d in drafts:
+            counter += 1
+            if d.unresolved_governor:
+                # Unknown to the lexicon: no lemma, no meaning, only structure.
+                lemma, pred, pcls = d.lex.low, UNRESOLVED_GOVERNOR, UNRESOLVED_GOVERNOR_CLASS
+            else:
+                lemma = _lemma(d.lex)
+                pred, pcls = predicate_of(lemma)
+            if pred == "NEED" and d.subject in {None,"il"}:
+                d.subject_person="impersonal"  # grammatical role, no inserted subject
+            if pred == "BE":
+                pred, pcls = "BE_PRESENT", "state"
+            pol = _polarity(clause.toks, d, clause, drafts)
+            objs = _objects_for(clause.toks, d, clause)
+            if pol["negator"] in {"rien", "personne"} and not objs:
+                objs = [Argument(pol["negator"], "*", "NEGATIVE_QUANTIFIER", "LITERAL")]
+            if pol["negator"] == "aucun" or pol["negator"] == "aucune":
+                pol["negator"] = "aucun"
+            unit = PredicateUnit(
+                id=f"u{counter}", predicate=pred, lemma=lemma, surface=d.lex.low,
+                span=(d.lex.start, d.lex.end), clause=ci, predicate_class=pcls,
+                verb_form=d.verb_form, polarity=pol["polarity"], negator=pol["negator"],
+                negation_confirmed=pol["negation_confirmed"], ne_omitted=pol["ne_omitted"],
+                ne_expletive=pol["ne_expletive"], restriction=pol["restriction"],
+                modality=d.modality, politeness=d.politeness, tense_aspect=d.tense,
+                subject=d.subject, objects=tuple(objs), confidence=pol["confidence"],
+            )
+            if d.lex.accentless_ambiguous:
+                unit = replace(unit, confidence=min(unit.confidence, 0.9))
+            if pol["negator"] == "ne":
+                ambiguities.append(f"bare_ne:{unit.id}")
+            _mark_governed(clause, d, pol)
+            clause.units.append((unit, d))
+            units.append(unit)
+
+    # "pas besoin de" + infinitive
+    for clause in clauses:
+        lows = [t.low for t in clause.toks]
+        for idx in range(len(lows) - 2):
+            # H16 A: "Il n'est pas obligatoire / nécessaire de lancer P" is the same absence of
+            # obligation (declarative only: the question stays a question)
+            if lows[idx] == "pas" and lows[idx + 2] in {"de", "d'"} and (
+                    lows[idx + 1] == "besoin"
+                    or (lows[idx + 1] in {"obligatoire", "nécessaire"} and not interrogative)):
+                for n, (u, d) in enumerate(clause.units):
+                    if d.lex_index > idx + 2:
+                        clause.units[n] = (replace(u, polarity="positive", negator=None,
+                                                   ne_omitted=False, pragmatic="NOT_REQUIRED",
+                                                   confidence=0.9), d)
+                        break
+
+    # ── pragmatic / epistemic by clause role ──
+    main_heads: list[tuple[int, PredicateUnit]] = []
+    preposed_purposes: list[tuple[int, str]] = []   # D7: (clause index, purpose unit) awaiting its host
+
+    def head_of(ci: int) -> PredicateUnit | None:
+        return clauses[ci].units[0][0] if clauses[ci].units else None
+
+    def last_of(ci: int) -> PredicateUnit | None:
+        return clauses[ci].units[-1][0] if clauses[ci].units else None
+
+    # clause -> (governor unit, host clause), reused by a coordinated sibling
+    resolved: dict[int, tuple[PredicateUnit | None, _Clause | None]] = {}
+    complement_alternatives: list[list[PredicateUnit]] = []
+    complement_conjunctions: list[list[PredicateUnit]] = []
+    for ci, clause in enumerate(clauses):
+        parent_unit, host = None, clauses[ci - 1] if ci > 0 else None
+        if clause.coordinated_with is not None and id(clause.coordinated_with) in resolved:
+            parent_unit, host = resolved[id(clause.coordinated_with)]
+        elif clause.rel_sibling is not None and id(clause.rel_sibling) in resolved:
+            # N7b: a predicate coordinated inside a relative shares its sibling's parent (if
+            # any); never embedded under the sibling itself
+            parent_unit, host = resolved[id(clause.rel_sibling)]
+        else:
+            if clause.embedding_parent is not None and clause.embedding_parent < ci:
+                parent_unit = last_of(clause.embedding_parent)
+            # embedding parent may have been merged; fall back to previous clause
+            if clause.conn in {"que", "rel", "comparative"} and parent_unit is None and ci > 0:
+                parent_unit = last_of(ci - 1)
+        resolved[id(clause)] = (parent_unit, host)
+        new_units = []
+        for n, (u, d) in enumerate(clause.units):
+            prag, epi, realized = u.pragmatic, "NOT_APPLICABLE", None
+            embedded_under, operator_negated = None, False
+            if prag == "NOT_REQUIRED":
+                new_units.append((u, d))
+                continue
+            if clause.conn in {"sans", "sans_que"} and n == 0:
+                prag = "FORBIDDEN"
+            elif clause.complement_structure_lost:
+                # Relative and complement predicate share a clause whose complement
+                # structure was lost: subordinated under the governor, unknown
+                # governance, never an asserted relative of the governor.
+                prag, epi = "EMBEDDED", UNRESOLVED_GOVERNANCE
+                ambiguities.append(f"complement_structure_lost:{u.id}")
+                if parent_unit is not None:
+                    embedded_under = parent_unit.id
+                    relations.append(LatticeRelation(RelationKind.EMBEDS.value, parent_unit.id, u.id,
+                                                     evidence="que_governor_lost"))
+            elif clause.attachment_ambiguous and n == 0:
+                # Several attachments stay open: never the nearest governor,
+                # never a root assertion.
+                prag, epi = "EMBEDDED", UNRESOLVED_GOVERNANCE
+                ambiguities.append(f"coordination_attachment_ambiguous:{u.id}")
+                if clause.rel_member_possible_request and u.polarity == "positive" and d.subject is None:
+                    d.possible_request = True   # N7b: one reading is the host's directive (H11 C)
+                if clause.after_postposed_protasis and u.polarity == "negative" and d.subject is None \
+                        and u.verb_form in {"INFINITIVE", "IMPERATIVE"} and d.head_index == d.lex_index \
+                        and not any(c.modal is not None for c in clauses[:ci]
+                                    if c.conn in _POSTPOSED_ATTACH_CONNS or c.postposed_subordinate):
+                    # "Lance R si P et ne pas / n'exécute pas Q": one reading is a main-clause
+                    # prohibition; in doubt it is kept (never relaxes execution), still named
+                    prag = "FORBIDDEN"
+                elif clause.after_postposed_protasis and u.polarity == "positive" and d.subject is None \
+                        and u.verb_form in {"INFINITIVE", "IMPERATIVE"} and d.head_index == d.lex_index \
+                        and d.modality is None:
+                    # "Lance R si Paul lance P et exécute Q": one reading is a main-clause request;
+                    # never REQUESTED, but exposed as a possible request (existing runtime path)
+                    d.possible_request = True
+            elif clause.conn == "que" and parent_unit is None and n == 0 and host is not None and any(
+                    t.low in {"paraît", "parait"} for t in host.toks):
+                prag, epi = "REPORTED", "HEARSAY"
+            elif clause.conn == "que" and parent_unit is not None and n == 0:
+                embedded_under = parent_unit.id
+                pp = parent_unit.predicate
+                if pp == "SAY":
+                    prag = "REPORTED"
+                    epi = "HEARSAY" if parent_unit.subject in {"on", "ils", "they"} else "REPORTED"
+                    kind = RelationKind.REPORTS
+                elif pp == "FEAR" or (pp in {"HAVE"}):
+                    prag, epi, kind = "FEARED", "POSSIBLE", RelationKind.FEARS
+                elif pp == "PREVENT":
+                    prag, kind = "PREVENTED", RelationKind.PREVENTS
+                elif pp == "BELIEVE":
+                    prag, epi, kind = "BELIEVED", "BELIEF", RelationKind.BELIEVES
+                elif pp == "LEARN":
+                    prag, epi, kind = "ASSERTED", "ASSERTED", RelationKind.EMBEDS
+                elif pp == "OBSERVE":
+                    prag, epi, kind = "ASSERTED", "ASSERTED", RelationKind.EMBEDS
+                elif pp == UNRESOLVED_GOVERNOR:
+                    # Governor meaning unknown: the complement is neither asserted
+                    # nor reported/believed/denied; it is only subordinated.
+                    prag, epi, kind = "EMBEDDED", "NOT_APPLICABLE", RelationKind.EMBEDS
+                    ambiguities.append(f"complement_under_unresolved_governor:{u.id}")
+                elif pp in {"WANT", "NEED"}:
+                    if parent_unit.polarity == "negative":
+                        # Do not turn NOT NEED(P) into NEED(NOT P), or a
+                        # negative desire into a positive child instruction.
+                        prag, epi, kind = "EMBEDDED", UNRESOLVED_GOVERNANCE, RelationKind.EMBEDS
+                        ambiguities.append(f"negated_scope_open:{u.id}")
+                    else:
+                        speaker_wants = pp == "NEED" or parent_unit.subject in _FIRST_PERSON
+                        prag = "REQUESTED" if speaker_wants else "REPORTED"
+                        if u.polarity == "negative" and speaker_wants:
+                            prag = "FORBIDDEN"
+                        kind = RelationKind.WANTS
+                else:
+                    # Known governor without an embedding contract: the complement
+                    # is subordinated, never promoted to a root assertion. KNOW has a
+                    # commitment profile: its governance is decided by that profile
+                    # (H04 closure policy, see _unresolved_profile_complements).
+                    prag, epi, kind = "EMBEDDED", UNRESOLVED_GOVERNANCE, RelationKind.EMBEDS
+                    if pp != "KNOW":
+                        ambiguities.append(f"unresolved_complement_governance:{u.id}")
+                relations.append(LatticeRelation(
+                    kind.value, parent_unit.id, u.id,
+                    evidence="que_unresolved_governance" if epi == UNRESOLVED_GOVERNANCE else "que"))
+            elif clause.conn in {"avant_que", "a_moins_que"} and n == 0:
+                prag, epi = "HYPOTHETICAL", "HYPOTHETICAL"
+            elif clause.conn == "pour_que" and n == 0:
+                # D7 B: the purpose content (role PURPOSE): neither asserted nor requested; its
+                # host is resolved below (unique structural host only)
+                prag, epi = "EMBEDDED", "NOT_APPLICABLE"
+                d.governed = "purpose"
+                preposed_purposes.append((ci, u.id))
+            elif clause.conn == "apres_que" and n == 0:
+                # temporal context of its host, presupposed by the construction, not asserted
+                # (the finite counterpart of "après avoir V")
+                prag, epi = "EMBEDDED", "NOT_APPLICABLE"
+                d.governed = "temporal"
+            elif clause.conn == "wh":
+                # H13: a WH complement under KNOW is question content. That closes
+                # the complement structure only; it does not assert the answer,
+                # occurrence, truth or verification of the embedded event.
+                prag, epi = "EMBEDDED", UNRESOLVED_GOVERNANCE
+                wg = clause.wh_governor
+                gov = next((x for c2 in clauses for (x, _) in (new_units if c2 is clause else c2.units)
+                            if x.span == (wg.start, wg.end)), None)
+                resolved_know_wh = gov is not None and gov.predicate == "KNOW"
+                requested_question = (requested_explanation_question_binding(raw,
+                    tuple(x for c2 in clauses for x,_ in (new_units if c2 is clause else c2.units)),gov)
+                    if gov is not None else None)
+                if resolved_know_wh or requested_question is not None:
+                    epi = "NOT_APPLICABLE"
+                else:
+                    ambiguities.append(f"unresolved_complement_governance:{u.id}")
+                if gov is not None:
+                    embedded_under = gov.id
+                    relations.append(LatticeRelation(
+                        RelationKind.EMBEDS.value, gov.id, u.id,
+                        evidence=("requested_explanation_question" if requested_question is not None else
+                                  "interrogative_complement" if resolved_know_wh else "wh_unresolved_governance")))
+            elif clause.conn == "quand":
+                # "quand / lorsque Q": order, simultaneity, habit or condition is a held
+                # doctrine: Q is subordinated, never asserted, no relation and no host chosen
+                prag, epi = "EMBEDDED", UNRESOLVED_GOVERNANCE
+                ambiguities.append(f"temporal_subordinate_open:{u.id}")
+            elif clause.conn == "si" and n == 0:
+                prag, epi = "HYPOTHETICAL", "HYPOTHETICAL"
+            elif clause.conn == "rel" and clause.governor_lost and n == 0:
+                # "que" complement whose governor could not be built ("se rend
+                # compte que", "pourrait se rendre compte que"): subordinated
+                # content of unknown governance, never a root assertion nor a
+                # relative asserted under whatever unit precedes it.
+                prag, epi = "EMBEDDED", UNRESOLVED_GOVERNANCE
+                ambiguities.append(f"complement_governor_lost:{u.id}")
+                if parent_unit is not None:
+                    embedded_under = parent_unit.id
+                    relations.append(LatticeRelation(RelationKind.EMBEDS.value, parent_unit.id, u.id,
+                                                     evidence="que_governor_lost"))
+            elif clause.conn in {"rel", "comparative"}:
+                prag, epi = "ASSERTED", "ASSERTED"
+                if d.verb_form == "INFINITIVE" and (d.governed == "unknown_governor" or (
+                        d.governed == "prep" and not any(x.id == d.governor_unit for (x, _) in new_units + clause.units))):
+                    # "le script qui sert à lancer P": the infinitive is content of an unrecognised
+                    # governor ("sert"), never an asserted "le script lance P"; the relation it
+                    # expresses is not represented (named, frame open)
+                    prag, epi = "EMBEDDED", "NOT_APPLICABLE"
+                    ambiguities.append(f"infinitive_under_unrecognized_governor:{u.id}")
+                    _keep_governor_material(clause, d, u.id)
+                rel_gov = next((x for (x, _) in new_units + clause.units if x.id == d.governor_unit), None) \
+                    if d.verb_form == "INFINITIVE" and d.governed == "prep" else None
+                if rel_gov is not None:
+                    # "la mémoire qui sert à parler": the infinitive is the content of the relative's
+                    # own known governor (SERVE_FOR), never an asserted action of the relative
+                    prag, epi = "EMBEDDED", "NOT_APPLICABLE"
+                    embedded_under = rel_gov.id
+                    serve = rel_gov.predicate == "SERVE_FOR"
+                    if serve:
+                        d.governed = "purpose"
+                    relations.append(LatticeRelation(RelationKind.EMBEDS.value, rel_gov.id, u.id,
+                                                     evidence="servir_a" if serve else "prep+inf"))
+                elif parent_unit is not None:
+                    embedded_under = parent_unit.id
+                    relations.append(LatticeRelation(RelationKind.EMBEDS.value, parent_unit.id,
+                                                     u.id, evidence=clause.conn))
+            elif d.governed == "subject_unresolved":
+                # "Paul lance P et exécutent Q": the predicate is kept, its subject is not
+                # the host's (no agreement) and is not known: never asserted, never requested
+                prag, epi = "EMBEDDED", UNRESOLVED_GOVERNANCE
+                ambiguities.append(f"subject_unresolved:{u.id}")
+            elif d.governed == "deontic_scope_open":
+                # "Tu n'as pas à lancer P": absence of obligation or no-right reading is held
+                # (H16); content of that negated "avoir à", never a request nor a prohibition
+                prag, epi = "EMBEDDED", "NOT_APPLICABLE"
+                ambiguities.append(f"deontic_scope_open:{u.id}")
+                u, d.subject_person = replace(u, subject=None), None
+            elif d.governed == "unknown_governor":
+                # Unknown governance may belong to a lexically attested host.
+                # A unique exact written host gives a structural EMBEDS link,
+                # not an admitted semantic relation or executable request.
+                prag, epi = "EMBEDDED", "NOT_APPLICABLE"
+                ambiguities.append(f"infinitive_under_unrecognized_governor:{u.id}")
+                hosts={x.id:x for c2 in clauses for (x,_) in (new_units if c2 is clause else c2.units)
+                       if d.governor_span is not None and x.span==d.governor_span and x.id!=u.id}
+                if len(hosts)==1:
+                    host=next(iter(hosts.values()))
+                    embedded_under=host.id
+                    relations.append(LatticeRelation(RelationKind.EMBEDS.value,host.id,u.id,
+                                                     evidence="unresolved_complement_governance"))
+                if not d.possible_request:
+                    u, d.subject_person = replace(u, subject=None), None
+                # ("Tu viens lancer P.": the written addressee subject is kept, R3)
+            elif d.governed in {"negated_scope_open", "know_how_scope_open"}:
+                # an infinitive under a negated operator (or a savoir chain) whose scope over
+                # it is not established: its content, never an injunction, no polarity chosen
+                prag, epi = "EMBEDDED", "NOT_APPLICABLE"
+                ambiguities.append(f"{d.governed}:{u.id}")
+                gov = next((x for c2 in clauses for (x, _) in (new_units if c2 is clause else c2.units)
+                            if x.span == d.governor_span), None)
+                if gov is not None:
+                    embedded_under = gov.id
+                    relations.append(LatticeRelation(RelationKind.EMBEDS.value, gov.id, u.id,
+                                                     evidence=d.governed))
+            elif d.governed == "wh":
+                prag, epi = ("ASKED", "UNKNOWN") if interrogative else ("EMBEDDED", "NOT_APPLICABLE")
+            elif d.governed in {"purpose", "temporal", "permission"}:
+                prag, epi = "EMBEDDED", "NOT_APPLICABLE"
+                if d.governed == "purpose":
+                    # D7 B: "Paul lance P pour tester Q": the purpose is embedded under its host
+                    # (EMBEDS host -> purpose, evidence "pour"; role PURPOSE) only when the host is
+                    # structurally unique: the one main unit before it in an uncoordinated clause.
+                    # Never a cause, condition or authority; no occurrence of the purpose.
+                    prior = [x for (x, _) in new_units if x.embedded_under is None]
+                    coordinated = ci > 0 and (clause.conn in {"et", "ou", "puis", "mais"}
+                                              or (clause.conn is None and clause.boundary == ","))
+                    if len(prior) == 1 and not coordinated:
+                        embedded_under = prior[0].id
+                        relations.append(LatticeRelation(RelationKind.EMBEDS.value, prior[0].id, u.id,
+                                                         evidence="pour"))
+                    elif not prior and n == 0 and (ci == 0 or clause.boundary in _SENTENCE_BOUNDARIES):
+                        preposed_purposes.append((ci, u.id))   # "Pour tester Q, lance P": below
+                    else:
+                        ambiguities.append(f"coordination_attachment_ambiguous:{u.id}")
+            elif d.governed == "observation_target":
+                prag, epi = "EMBEDDED", "NOT_APPLICABLE"
+                gov = next((x for (x, _) in new_units + clause.units if x.id == d.governor_unit), None)
+                if gov is not None:
+                    embedded_under = gov.id
+                    relations.append(LatticeRelation(RelationKind.EMBEDS.value, gov.id, u.id,
+                                                     evidence="observation+inf"))
+            elif d.governed == "modal_governor":
+                prag, epi = "EMBEDDED", "NOT_APPLICABLE"
+                gov = next((x for (x, _) in new_units + clause.units if x.id == d.governor_unit), None)
+                if gov is not None:
+                    embedded_under = gov.id
+                    relations.append(LatticeRelation(RelationKind.EMBEDS.value, gov.id, u.id,
+                                                     evidence="modal+inf"))
+            elif d.governed == "prep":
+                # (F-B3G-1: a coordinated member's governor may live in an earlier clause)
+                gov = next((x for c2 in clauses for (x, _) in (new_units if c2 is clause else c2.units)
+                            if x.id == d.governor_unit), None) if d.governor_unit is not None else None
+                if gov is not None and gov.predicate in {"FORGET", "HESITATE"} and d.governor_negated \
+                        and gov.verb_form == "IMPERATIVE":
+                    # "n'oublie pas de lancer", "n'hésite pas à lancer": reminder / invitation, only
+                    # as a directive (imperative); "Paul n'a pas oublié de tester Q" is no request (N1)
+                    prag, epi = "REQUESTED", "NOT_APPLICABLE"
+                else:
+                    prag, epi = "EMBEDDED", "NOT_APPLICABLE"
+                    if gov is None:
+                        d.governed = "unknown_prep"
+                        ambiguities.append(f"infinitive_under_unrecognized_governor:{u.id}")
+                        _keep_governor_material(clause, d, u.id)
+                if gov is not None:
+                    embedded_under = gov.id
+                    serve = gov.predicate == "SERVE_FOR"
+                    if serve:
+                        # "X sert à Y": Y is X's expressed functional purpose (role PURPOSE),
+                        # never an occurrence nor a request of Y; provenance "servir_a"
+                        d.governed = "purpose"
+                    relations.append(LatticeRelation(RelationKind.EMBEDS.value, gov.id, u.id,
+                                                     evidence="servir_a" if serve else "prep+inf"))
+            else:
+                prag, epi = _main_pragmatics(u, d, interrogative, ambiguities)
+            if d.governed == "unknown_governor" and f"infinitive_under_unrecognized_governor:{u.id}" not in ambiguities:
+                # "à moins que Paul veuille lancer P": a subordinate branch set its pragmatics;
+                # the unrecognised governor is still named and its surface kept (N11)
+                ambiguities.append(f"infinitive_under_unrecognized_governor:{u.id}")
+                if d.governor_span is not None:
+                    lost_governors.append((d.governor_span, u.id))
+            if d.governed == "subject_unresolved" and f"subject_unresolved:{u.id}" not in ambiguities:
+                # whatever branch set its pragmatics (protasis, ambiguous attachment...), a
+                # finite verb whose subject is unknown is always named (R1)
+                ambiguities.append(f"subject_unresolved:{u.id}")
+            if d.compound_modal:
+                # whether "a pu / a dû / a voulu V" happened is not decided: never realized
+                ambiguities.append(f"modal_past_occurrence_open:{u.id}")
+            elif u.tense_aspect in {"PAST", "PLUPERFECT", "RECENT_PAST"} and prag in {
+                    "ASSERTED", "REPORTED", "BELIEVED", "ASKED"}:
+                realized = True if prag != "ASKED" else None
+            if u.tense_aspect == "AVERTED":
+                realized, epi = False, "COUNTERFACTUAL"
+            if interrogative and d.lex is clause.ni_scope_open and d.modality is None \
+                    and _MODALITY.get(_pred(d.lex)) == "ABILITY_OR_PERMISSION":
+                # "Ne peux-tu ni lancer P ni exécuter Q ?": the act of the negated ability
+                # question over its open ni members is not decided either (named)
+                ambiguities.append(f"negated_speech_act_open:{u.id}")
+            head_negated = interrogative and d.head_index != d.lex_index and d.head_index > 0                 and clause.toks[d.head_index - 1].low in {"ne", "n'"}
+            if prag == "INDIRECT_REQUEST" and u.polarity == "negative" and (
+                    _negates_operator(clause.toks, d) or head_negated):
+                # "Ne peux-tu pas lancer P ?", "Tu ne lances pas P ?": the negation bears on
+                # the question / ability operator, not on a requested content: never a
+                # prohibition; which act it is stays open (named), no constraint. H10: the
+                # request reading (do P) remains possible: it keeps the normal gate (below)
+                ambiguities.append(f"negated_speech_act_open:{u.id}")
+                if any(t.low in {"ne", "n'"} for t in clause.toks[d.head_index + 1:d.lex_index]):
+                    # "Tu peux pas ne pas lancer P ?": the content is negated too; its request
+                    # reading would be "do not launch P" (not represented): open, no gate,
+                    # never a prohibition (H10 option A)
+                    ambiguities.append(f"negated_scope_open:{u.id}")
+                else:
+                    operator_negated = True
+            elif prag in {"REQUESTED", "FORBIDDEN", "INDIRECT_REQUEST"} and u.polarity == "negative":
+                prag = "FORBIDDEN"
+            elif prag == "FORBIDDEN" and u.polarity == "positive" and clause.conn not in {"sans", "sans_que"}:
+                prag = "REQUESTED"
+            if clause.evidential is not None and n == 0 and prag == "ASSERTED" and epi == "ASSERTED":
+                epi = clause.evidential
+            elif clause.evidential is not None and n == 0 and clause.evidential_span is not None:
+                # S12: a detached source over a non-assertive or modified unit (request, question,
+                # negation...) has no positive reading decided yet: reported, never dropped
+                detached_sources.append(f"{UNANALYZED_PREDICATIVE_CONTENT}:{clause.evidential_span[0]}-"
+                                        f"{clause.evidential_span[1]}:detached_source_of={u.id}")
+            tmp = replace(u, pragmatic=prag, epistemic=epi, realized=realized,
+                          embedded_under=embedded_under)
+            role = _role(tmp, d, prag, interrogative)
+            agent = _action_agent(tmp, d, prag)
+            target = _request_target(tmp, agent, prag, role)
+            if operator_negated and u.predicate_class == "world_action" and (
+                    agent == "ADDRESSEE" or (agent == "IMPERSONAL" and u.modality == "OBLIGATION")):
+                # H10: the negation bears on the question operator; the content of the possible
+                # request is the positive action: ambiguous request, gate kept, never FORBIDDEN
+                role, target = "AMBIGUOUS_REQUEST", "ADDRESSEE_OR_POSSIBLE_ADDRESSEE"
+            new_units.append((replace(tmp, action_agent=agent, request_target=target,
+                                      role=role), d))
+        clause.units = new_units
+        sibling = clause.coordinated_with
+        if sibling is not None and sibling.units and new_units:
+            a, b = sibling.units[0][0], new_units[0][0]
+            if clause.conn_toks and clause.conn_toks[0].low == "ou":
+                # "V que P ou que Q": sibling complements in one disjunction
+                relations.append(LatticeRelation(RelationKind.ALTERNATIVE.value, a.id, b.id, evidence="ou que"))
+                group = next((g for g in complement_alternatives if g[-1] is a), None)
+                if group is None:
+                    complement_alternatives.append([a, b])
+                else:
+                    group.append(b)
+            else:
+                relations.append(LatticeRelation(RelationKind.COORDINATES.value, a.id, b.id, evidence="et que"))
+                # H02: "V que P et que Q" keeps its group target, by parity with "ou que"
+                group = next((g for g in complement_conjunctions if g[-1] is a), None)
+                if group is None:
+                    complement_conjunctions.append([a, b])
+                else:
+                    group.append(b)
+        # Temporal infinitives mention context; preserve legacy fail-closed
+        # behavior when a PREPARE request is framed as before executing.
+        if clause.conn in {"avant_de", "apres"} and clause.units and main_heads:
+            prev = main_heads[-1][1]
+            u, d = clause.units[0]
+            if prev.predicate == "PREPARE" and u.predicate_class == "world_action":
+                clause.units[0] = (replace(u, pragmatic="REQUESTED", epistemic="NOT_APPLICABLE",
+                                           action_agent="ADDRESSEE", request_target="ADDRESSEE",
+                                           role="REQUEST"), d)
+
+        # Subordinate clauses (reason, condition, embedding...) never become the
+        # host of a following "puis" / "mais": only main clauses do. A clause of
+        # ambiguous attachment is not known to be one.
+        if clause.conn not in {"que", "rel", "comparative", "sans", "sans_que", "si",
+                               "avant_que", "a_moins_que", "apres_que", "pour_que", "quand", "wh", "car"} and clause.units                 and not clause.attachment_ambiguous and clause.prep_member_of is None:
+            main_heads.append((ci, clause.units[0][0]))
+
+    for group in complement_alternatives:
+        coordinations.append(CoordinationRef(
+            f"c{len(coordinations) + 1}", "OR", tuple(u.id for u in group), "disjunction",
+            tuple("ou que" for _ in group[1:]), (group[0].span[0], group[-1].span[1])))
+    for group in complement_conjunctions:
+        coordinations.append(CoordinationRef(
+            f"c{len(coordinations) + 1}", "AND", tuple(u.id for u in group), "complement_conjunction",
+            tuple("et que" for _ in group[1:]), (group[0].span[0], group[-1].span[1])))
+
+    def _replace_group_unit(unit: PredicateUnit) -> None:
+        for c in clauses:
+            for i, (old, d) in enumerate(c.units):
+                if old.id == unit.id:
+                    c.units[i] = (unit, d)
+                    return
+
+    def _share_group_arguments(members: list[PredicateUnit], *, subject: str | None = None) -> list[PredicateUnit]:
+        updated = list(members)
+        if subject is not None:
+            updated = [replace(u, subject=subject) if u.subject is None else u for u in updated]
+        object_sources = [u.objects for u in updated if u.objects]
+        if len(object_sources) == 1:
+            shared_objects = object_sources[0]
+            last_predicate_end = max(u.span[1] for u in updated)
+            shared_after_coordination = all(arg.span is not None and arg.span[0] >= last_predicate_end
+                                            for arg in shared_objects)
+            if shared_after_coordination:
+                updated = [replace(u, objects=shared_objects) if not u.objects else u for u in updated]
+        for before, after in zip(members, updated):
+            if before is not after:
+                _replace_group_unit(after)
+        return updated
+    # ── shared auxiliary: host AUX+PP predicate and the bare participles sharing it ──
+    for host in [c for c in clauses if c.shared_aux_host is None and c.compound is not None]:
+        sharers = [c for c in clauses if c.shared_aux_host is host]
+        if not sharers:
+            continue
+        unit_of = {id(d): u for c in (host, *sharers) for (u, d) in c.units}
+        members = [unit_of.get(id(c.compound[2])) for c in (host, *sharers)]
+        if any(u is None for u in members):
+            continue
+        members = _share_group_arguments(members, subject=members[0].subject)
+        for c, a, b in zip(sharers, members, members[1:]):
+            if c.conn is None and _share_kind(sharers) == "AND":  # ", PP": no connective relation was built for it
+                relations.append(LatticeRelation(RelationKind.COORDINATES.value, a.id, b.id, evidence=","))
+        coordinations.append(CoordinationRef(
+            f"c{len(coordinations) + 1}", _share_kind(sharers), tuple(u.id for u in members), "shared_auxiliary",
+            (host.compound[1], *(" ".join(x.low for x in c.conn_toks) or "," for c in sharers)),
+            (members[0].span[0], members[-1].span[1])))
+
+    operator_scopes: list[OperatorScopeRef] = []
+    participant_configurations: list[ParticipantConfigurationRef] = []
+    oblique_arguments: list[ObliqueArgumentRef] = []
+    manner_modifiers: list[MannerRef] = []
+    negated_manner: set[str] = set()
+
+    def _configure(unit: str, kind: str, cue: str, span: tuple[int, int], group: str | None = None) -> None:
+        participant_configurations.append(ParticipantConfigurationRef(
+            f"p{len(participant_configurations) + 1}", unit, "subject", kind, cue, span, group))
+
+    def _scope_operator(m: _Draft, coord: CoordinationRef) -> None:
+        # one "pouvoir" over the coordination: one speech act, derived from the modal itself
+        tok = m.modal_tok or m.lex
+        if _MODALITY.get(_pred(tok)) != "ABILITY_OR_PERMISSION":
+            return
+        act = _ability_speech_act(m, interrogative)
+        operator_scopes.append(OperatorScopeRef(
+            f"o{len(operator_scopes) + 1}", "ABILITY_OR_PERMISSION", tok.low, coord.id, act,
+            "ADDRESSEE_OR_POSSIBLE_ADDRESSEE" if act == "INDIRECT_REQUEST" else "NONE",
+            (tok.start, coord.span[1])))
+
+    # ── shared modality: host modal+infinitive predicate and the bare infinitives sharing it ──
+    for host in [c for c in clauses if c.shared_modal_host is None and c.modal is not None]:
+        sharers = [c for c in clauses if c.shared_modal_host is host]
+        if not sharers:
+            continue
+        unit_of = {id(d): u for c in (host, *sharers) for (u, d) in c.units}
+        members = [unit_of.get(id(host.modal))] + [unit_of.get(id(c.units[0][1])) if c.units else None
+                                                   for c in sharers]
+        if any(u is None for u in members):
+            continue
+        members = _share_group_arguments(members)
+        for c, a, b in zip(sharers, members, members[1:]):
+            if c.conn is None and _share_kind(sharers) == "AND":  # ", INF": no connective relation was built for it
+                relations.append(LatticeRelation(RelationKind.COORDINATES.value, a.id, b.id, evidence=","))
+        coordinations.append(CoordinationRef(
+            f"c{len(coordinations) + 1}", _share_kind(sharers), tuple(u.id for u in members),
+            "shared_directive" if host.modal.directive
+            else "shared_periphrasis" if host.modal.modality is None else "shared_modality",
+            (host.modal.modal_tok.low, *(" ".join(x.low for x in c.conn_toks) or "," for c in sharers)),
+            (members[0].span[0], members[-1].span[1])))
+        _scope_operator(host.modal, coordinations[-1])
+
+    # ── shared subject: host predicate with an explicit subject and the bare agreeing verbs ──
+    for host in [c for c in clauses if c.shared_subject_host is None and c.subject_host is not None]:
+        sharers = [c for c in clauses if c.shared_subject_host is host]
+        if not sharers:
+            continue
+        unit_of = {id(d): u for c in (host, *sharers) for (u, d) in c.units}
+        members = [unit_of.get(id(host.subject_host))] + [unit_of.get(id(c.units[0][1])) if c.units else None
+                                                          for c in sharers]
+        if any(u is None for u in members):
+            continue
+        for c, a, b in zip(sharers, members, members[1:]):
+            if c.conn is None and _share_kind(sharers) == "AND":  # ", V": no connective relation was built for it
+                relations.append(LatticeRelation(RelationKind.COORDINATES.value, a.id, b.id, evidence=","))
+        coordinations.append(CoordinationRef(
+            f"c{len(coordinations) + 1}", _share_kind(sharers), tuple(u.id for u in members), "shared_subject",
+            (host.subject_host.subject, *(" ".join(x.low for x in c.conn_toks) or "," for c in sharers)),
+            (members[0].span[0], members[-1].span[1])))
+
+    # ── verbal ni coordination: one structural group per "ne ... ni ... ni" ──
+    ni_heads = [c for c in clauses if c.ni_head is c]
+    for head in ni_heads:
+        members = [u for c in clauses if c.ni_head is head for (u, d) in c.units
+                   if d.head_index > 0 and c.toks[d.head_index - 1].low == "ni" and u.negator == "ni"]
+        if len(members) < 2:
+            continue
+        for a, b in zip(members, members[1:]):
+            relations.append(LatticeRelation(RelationKind.COORDINATES.value, a.id, b.id, evidence="ni"))
+        coordinations.append(CoordinationRef(
+            f"c{len(coordinations) + 1}", "AND", tuple(u.id for u in members), "ni_negative_coordination",
+            tuple("ni" for _ in members), (members[0].span[0], members[-1].span[1])))
+        if isinstance(head.ni_modal, _Draft):
+            _scope_operator(head.ni_modal, coordinations[-1])
+
+    def _scope_hosts(ci: int) -> list[PredicateUnit]:
+        """Main units a subordinate at ci may scope over, never one chosen by proximity: the
+        preceding main head of its sentence and the members coordinated with it (et / ou /
+        puis / mais / ,); for a preposed subordinate, the next main head."""
+        prev = [(cj, u) for (cj, u) in main_heads if cj < ci
+                and not any(c.boundary in _SENTENCE_BOUNDARIES for c in clauses[cj + 1:ci + 1])]
+        if not prev:
+            # preposed: the next main head and the members coordinated after it (D1-F1)
+            nxts = [(cj, u) for (cj, u) in main_heads if cj > ci]
+            if not nxts:
+                return []
+            hosts = [nxts[0][1]]
+            for (cj, u), (cj2, u2) in zip(nxts, nxts[1:]):
+                c2 = clauses[cj2]
+                if any(c.boundary in _SENTENCE_BOUNDARIES for c in clauses[cj + 1:cj2 + 1]) or not (
+                        c2.conn in {"et", "ou", "puis", "mais"} or (c2.conn is None and c2.boundary == ",")):
+                    break
+                hosts.append(u2)
+            return hosts
+        cj, u = prev[-1]
+        hosts = [u]
+        while clauses[cj].conn in {"et", "ou", "puis", "mais"} or (clauses[cj].conn is None
+                                                                   and clauses[cj].boundary == ","):
+            earlier = [(k, v) for (k, v) in prev if k < cj]
+            if not earlier:
+                break
+            cj, u = earlier[-1]
+            hosts.insert(0, u)
+        return hosts
+
+    def _adjacent_host(ci: int) -> PredicateUnit | None:
+        """Main head structurally adjacent to the subordinate at ci (the clause right before a
+        postposed one, right after a preposed one), else None (never a farther / nearest host)."""
+        heads = dict(main_heads)
+        if ci > 0 and ci - 1 in heads and clauses[ci].boundary in {None, ","}:
+            return heads[ci - 1]
+        first = ci == 0 or clauses[ci].boundary in _SENTENCE_BOUNDARIES
+        if first and ci + 1 in heads and clauses[ci + 1].boundary in {None, ","}:
+            return heads[ci + 1]
+        return None
+
+    def _temporal_hosts(ci: int) -> list[PredicateUnit] | None:
+        """Possible hosts of a temporal subordinate when there are several, else None."""
+        hosts = _scope_hosts(ci)
+        if ci + 1 < len(clauses) and clauses[ci + 1].main_after_protasis and clauses[ci + 1].units:
+            hosts.append(clauses[ci + 1].units[0][0])
+        return hosts if len(hosts) > 1 else None
+
+    # D7: a preposed purpose ("Pour tester Q, lance P") is embedded under its structurally
+    # adjacent host only (never a farther / nearest one); otherwise its attachment is named
+    for ci, uid in preposed_purposes:
+        host = _adjacent_host(ci)
+        if host is None or len(_scope_hosts(ci)) != 1:   # "Pour T, lance P et exécute R": scope open
+            ambiguities.append(f"coordination_attachment_ambiguous:{uid}")
+            continue
+        evidence = "pour_que" if clauses[ci].conn == "pour_que" else "pour"
+        relations.append(LatticeRelation(RelationKind.EMBEDS.value, host.id, uid, evidence=evidence))
+        clauses[ci].units = [(replace(x, embedded_under=host.id) if x.id == uid else x, dd)
+                             for (x, dd) in clauses[ci].units]
+
+    # ── inter-clause relations ──
+    alternatives: list[list[PredicateUnit]] = []
+    for ci, clause in enumerate(clauses):
+        h = head_of(ci)
+        # a protasis head without a unit ("Si Nadia et Luc exécutent Q"): its group still conditions
+        if h is None and not (clause.conn == "si" and clause.protasis_head is clause):
+            continue
+        conn = clause.conn
+        if conn == "quand" and h is not None and clause.conn_toks \
+                and clause.conn_toks[0].low in {"sauf", "excepté", "excepte"}:
+            # "sauf quand P": the exception is named too; no relation is chosen
+            hosts = _scope_hosts(ci)
+            if len(hosts) == 1:
+                # H17 A: one structural host: EXCEPTS; its temporal reading stays held
+                # (temporal_subordinate_open is not erased)
+                relations.append(LatticeRelation(RelationKind.EXCEPTS.value, h.id, hosts[0].id,
+                                                 evidence=" ".join(t.low for t in clause.conn_toks)))
+            else:
+                ambiguities.append(f"exception_condition_open:{h.id}"
+                                   + (f":host={','.join(u.id for u in hosts)}" if hosts else ""))
+        elif conn == "quand" and h is not None and _adjacent_host(ci) is not None:
+            # H05: "quand / lorsque P" temporally anchors its host (no order, condition or cause);
+            # "pendant que P" overlaps it. Only a structurally adjacent host is related; a
+            # coordinated host group is named (no host by proximity). Closure policy held.
+            kind = RelationKind.OVERLAPS if clause.conn_toks and clause.conn_toks[0].low == "pendant" \
+                else RelationKind.TEMPORAL_ANCHOR
+            hosts = _scope_hosts(ci)
+            if len(hosts) == 1:
+                relations.append(LatticeRelation(kind.value, h.id, hosts[0].id,
+                                                 evidence=" ".join(x.low for x in clause.conn_toks)))
+                # H05 closure policy: typed relation + exactly one structural host -> the
+                # temporal subordinate is structurally complete (other blockers still apply)
+                if f"temporal_subordinate_open:{h.id}" in ambiguities:
+                    ambiguities.remove(f"temporal_subordinate_open:{h.id}")
+            elif len(hosts) > 1:
+                ambiguities.append(f"temporal_scope_ambiguous:{h.id}:host={','.join(u.id for u in hosts)}")
+        prev_main =next((u for (cj, u) in reversed(main_heads) if cj < ci), None)
+        next_main = next((u for (cj, u) in main_heads if cj > ci), None)
+        if conn in {"sans", "sans_que"}:
+            host = prev_main or next_main
+            if host is not None:
+                relations.append(LatticeRelation(RelationKind.FORBIDS.value, host.id, h.id,
+                                                 evidence=conn))
+        elif conn == "si" and clause.protasis_head is not None and clause.protasis_head is not clause:
+            pass  # member of a conjunctive protasis: related through its head's group
+        elif conn == "si":
+            host = next_main if next_main is not None else prev_main
+            # a postposed protasis ("R si P") conditions the main clause it follows, never
+            # the next main head by proximity; when that clause is itself a coordinated
+            # member ("R et Q si P") the scope over the coordination is not decided (H11):
+            # no CONDITIONS target is chosen, the open scope is named (N5)
+            prev_ci = next((cj for (cj, u) in reversed(main_heads) if cj < ci), None)
+            scope_open = False
+            if prev_ci is not None and clause.protasis_head is None and clause.boundary in {None, ","} \
+                    and not any(c.boundary in _SENTENCE_BOUNDARIES for c in clauses[prev_ci + 1:ci]):
+                host = prev_main
+                pc = clauses[prev_ci]
+                earlier = [cj for (cj, _) in main_heads if cj < prev_ci
+                           and not any(c.boundary in _SENTENCE_BOUNDARIES for c in clauses[cj + 1:prev_ci + 1])]
+                scope_open = bool(earlier) and (pc.conn in {"et", "ou", "puis", "mais"}
+                                                or (pc.conn is None and pc.boundary == ","))
+                scope_open = scope_open or (ci + 1 < len(clauses) and clauses[ci + 1].main_after_protasis)
+            source = h.id if h is not None else None
+            if clause.protasis_head is clause:
+                group = [c for c in clauses if c.protasis_head is clause and c.units]
+                heads = [c.units[0][0] for c in group]
+                if source is None:
+                    if not heads:
+                        continue
+                    source = heads[0].id
+                links = tuple(" ".join(x.low for x in c.conn_toks) for c in group[1:])
+                # R2: a preposed disjunctive protasis ("Si P ou Q, R") is one OR group
+                disjunctive = bool(links) and all(x == "ou" for x in links)
+                mixed = {"et", "ou"} <= set(links)
+                for a, (b, link) in zip(heads, zip(heads[1:], links)):
+                    pair = RelationKind.ALTERNATIVE if (disjunctive or (mixed and link == "ou")) \
+                        else RelationKind.COORDINATES
+                    relations.append(LatticeRelation(pair.value, a.id, b.id, evidence=link))
+                if mixed:
+                    # "Si P et Q ou S, R": AND / OR without written grouping: no group, no
+                    # precedence, no CONDITIONS from an invented grouping; the open grouping and
+                    # the held condition of R are named; R itself (and its gate) is unchanged
+                    ambiguities.append(f"coordination_attachment_ambiguous:{heads[0].id}")
+                    if host is not None:
+                        ambiguities.append(f"condition_scope_ambiguous:{heads[0].id}:host={host.id}")
+                    continue
+                if len(heads) > 1:
+                    source = f"c{len(coordinations) + 1}"
+                    coordinations.append(CoordinationRef(
+                        source, "OR" if disjunctive else "AND", tuple(u.id for u in heads),
+                        "conditional_protasis", links, (heads[0].span[0], heads[-1].span[1])))
+            if scope_open:
+                ambiguities.append(f"condition_scope_ambiguous:{source}")
+                if ci + 1 < len(clauses) and clauses[ci + 1].main_after_protasis and host is not None:
+                    # "R si tu P et exécute Q": R is conditioned in every reading, only the
+                    # extension to the following main member Q is open
+                    relations.append(LatticeRelation(RelationKind.CONDITIONS.value, source, host.id,
+                                                     evidence="si"))
+            elif host is not None:
+                relations.append(LatticeRelation(RelationKind.CONDITIONS.value, source, host.id,
+                                                 evidence="si"))
+        elif conn in {"apres_que", "avant_que"} and _temporal_hosts(ci) is not None:
+            # "R et Q avant / après que P": with several possible hosts no PRECEDES target is
+            # chosen (never the nearest); the temporal scope is named (not a condition scope)
+            hosts = _temporal_hosts(ci)
+            ambiguities.append(f"temporal_scope_ambiguous:{h.id}:host={','.join(u.id for u in hosts)}")
+        elif conn == "apres_que" and (prev_main or next_main) is not None:
+            host = prev_main if prev_main is not None else next_main
+            relations.append(LatticeRelation(RelationKind.PRECEDES.value, h.id, host.id,
+                                             evidence="après que"))
+        elif conn == "avant_que" and prev_main is not None:
+            relations.append(LatticeRelation(RelationKind.PRECEDES.value, prev_main.id, h.id,
+                                             evidence="avant que"))
+        elif conn == "a_moins_que":
+            # "sauf si / excepté si / à moins que P": an exception condition is not an ordinary
+            # CONDITIONS (its final relation is held, H17): no relation, the exception and its
+            # possible host(s) are named, their occurrence stays unresolved
+            hosts = _scope_hosts(ci)
+            if ci + 1 < len(clauses) and clauses[ci + 1].main_after_protasis and clauses[ci + 1].units:
+                hosts.append(clauses[ci + 1].units[0][0])   # forced main member after it: also open
+            if len(hosts) == 1:
+                # H17 A: one structural host: EXCEPTS(exception -> host), "the host holds except
+                # when the exception holds" (never CONDITIONS, CAUSES, PREVENTS nor a negation;
+                # no occurrence, request or authority from the relation)
+                relations.append(LatticeRelation(RelationKind.EXCEPTS.value, h.id, hosts[0].id,
+                                                 evidence=" ".join(t.low for t in clause.conn_toks)))
+            else:
+                ambiguities.append(f"exception_condition_open:{h.id}"
+                                   + (f":host={','.join(u.id for u in hosts)}" if hosts else ""))
+        elif clause.rel_sibling is not None and clause.rel_sibling.units and h is not None:
+            # N7b: predicates coordinated inside one relative ("qui teste P et exécute Q")
+            link = clause.conn_toks[0].low if clause.conn_toks else "et"
+            kind = {"et": RelationKind.COORDINATES, "ou": RelationKind.ALTERNATIVE,
+                    "puis": RelationKind.PRECEDES}.get(link, RelationKind.COORDINATES)
+            sib = clause.rel_sibling.units[-1][0].id
+            if not any({r.source, r.target} == {sib, h.id} for r in relations):   # (no duplicate)
+                relations.append(LatticeRelation(kind.value, sib, h.id, evidence=link))
+        elif clause.prep_member_of is not None:
+            # F-B3G-1: a member of one prep-governed chain coordinates with its sibling member
+            # (never with the governor, never a main-clause relation)
+            kind = {"et": RelationKind.COORDINATES, "ou": RelationKind.ALTERNATIVE,
+                    "puis": RelationKind.PRECEDES, "mais": RelationKind.CONTRASTS}.get(conn, RelationKind.COORDINATES)
+            relations.append(LatticeRelation(kind.value, clause.prep_member_of, h.id, evidence=conn or ","))
+        elif prev_main is not None and not clause.attachment_ambiguous and conn in {
+                "mais", "puis", "et", "ou", "donc", "car", "avant_de", "apres", "alors"}:
+            kind, src, tgt = {
+                "mais": (RelationKind.CONTRASTS, prev_main, h),
+                "puis": (RelationKind.PRECEDES, prev_main, h),
+                "avant_de": (RelationKind.PRECEDES, prev_main, h),
+                "apres": (RelationKind.PRECEDES, h, prev_main),
+                "et": (RelationKind.COORDINATES, prev_main, h),
+                "ou": (RelationKind.ALTERNATIVE, prev_main, h),
+                "donc": (RelationKind.CAUSES, prev_main, h),
+                "alors": (RelationKind.CAUSES, prev_main, h),
+                "car": (RelationKind.CAUSES, h, prev_main),
+            }[conn]
+            if conn == "avant_de" and prev_main.polarity == "negative":
+                # "ne lance pas X avant de le préparer" => préparer precedes lancer
+                src, tgt = h, prev_main
+            # "si P, alors Q": CONDITIONS already links P -> Q.
+            if not (conn == "alors" and any(c.conn == "si" for c in clauses[:ci])):
+                relations.append(LatticeRelation(kind.value, src.id, tgt.id, evidence=conn))
+            if conn == "ou":
+                # "P ou Q (ou R)": one disjunction over the branches, never an occurrence of one
+                group = next((g for g in alternatives if g[-1] is prev_main), None)
+                if group is None:
+                    alternatives.append([prev_main, h])
+                else:
+                    group.append(h)
+    for group in alternatives:
+        coordinations.append(CoordinationRef(
+            f"c{len(coordinations) + 1}", "OR", tuple(u.id for u in group), "disjunction",
+            tuple("ou" for _ in group[1:]), (group[0].span[0], group[-1].span[1])))
+
+    # ── unanalyzed predicative content: reported, never dropped (M8-0b) ──
+    # "<marker>:<start>-<end>:<link>[:ops=...]" — the span of the clause, its
+    # structural link when syntax gives it, and detectable scope operators.
+    missing: list[str] = list(detached_sources)
+    protases = [cj for cj, c in enumerate(clauses)
+                if c.conn == "si" or (c.toks and c.toks[0].low == "si")]
+    def verbless_si(ci: int) -> bool:
+        # "Si P, lance R": a verbless preposed protasis closed by its comma; never one whose
+        # subject is coordinated into the next clause ("Si Nadia et Luc exécutent Q")
+        c, nxt = clauses[ci], clauses[ci + 1] if ci + 1 < len(clauses) else None
+        return c.toks[0].low == "si" and nxt is not None and nxt.boundary == ","
+
+    for ci, clause in enumerate(clauses):
+        if not clause.toks:
+            continue
+        governed_by = None
+        if clause.units:
+            # Partial loss: a known modal / auxiliary whose unknown infinitive or
+            # participle produced no unit ("pourrait partir").
+            covered = {u.span for (u, _) in clause.units}
+            lost = [(k, j) for k, j in _lost_verb_evidence(clause)
+                    if (clause.toks[j].start, clause.toks[j].end) not in covered]
+            lost.extend((k,j) for k,j in _copula_evidence(clause)
+                        if (clause.toks[k].start,clause.toks[k].end) not in covered)
+            if not lost:
+                continue
+            k = lost[0][0]
+            governed_by = next((u for (u, _) in clause.units
+                                if u.span == (clause.toks[k].start, clause.toks[k].end)), None)
+        elif clause.conn not in {"quand", "rel", "a_moins_que"} and not verbless_si(ci) and not _unanalyzed_predicative(
+                clause, in_sequence=(in_seq := clause.conn in _SEQUENCE_CONNECTIVES
+                                     or (clause.conn is None and any(c.units for c in clauses if c is not clause)))
+                # D8: an utterance with no unit at all ("Cette clé permet l'accès."): an unknown
+                # verb introducing a determiner argument is a predication, reported (never zero
+                # representation); "Le test rouge." stays an NP
+                or (clause.conn is None and not any(c.units for c in clauses)),
+                complement_follows=(cmp_next := clause.conn is None and ci + 1 < len(clauses)
+                                    and clauses[ci + 1].conn in {"si", "que"} and clauses[ci + 1].units
+                                    and clauses[ci + 1].boundary is None)) \
+                and not _copula_evidence(clause) \
+                and not (clause.conn is None and not any(c.units for c in clauses) and any(
+                    t.low in {"que", "qu'", "qui"} and len(clause.toks) - k >= 3
+                    for k, t in enumerate(clause.toks) if k > 0)) \
+                and not clause.main_after_relative:   # R1-R5: a main predicate is never dropped
+            # (N8: "Le fichier que Marie ouvre disparaît": an utterance with no unit holding a
+            # relative followed by content is a predication with unknown verbs: reported)
+            # (a "quand / lorsque" subordinate, a verbless preposed protasis ("Si P, lance R",
+            # "Si possible, ...": a condition is never dropped, H11) or a relative ("qui est
+            # utile") without any unit is always reported; so is
+            # a copula + attribute clause in a subordinate or a sequence: "si c'est prêt")
+            continue
+        if not clause.units and clause.conn is None and ci + 1 < len(clauses) \
+                and clauses[ci + 1].conn in {"si", "que"} and clauses[ci + 1].units \
+                and clauses[ci + 1].boundary is None:
+            # D2b: "Paul ignore / se demande si P": the complement of that unknown governor is
+            # never a free protasis nor a root predication: its governance stays unresolved
+            ambiguities.append(f"complement_under_unresolved_governor:{clauses[ci + 1].units[0][0].id}")
+        content = clause.toks[1:] if clause.toks[0].low == "si" else clause.toks
+        if clause.conn in {"que", "rel"}:
+            parent = None
+            if clause.embedding_parent is not None and clause.embedding_parent < ci:
+                parent = last_of(clause.embedding_parent)
+            if parent is None and ci > 0:
+                parent = last_of(ci - 1)
+            if parent is not None:
+                link = f"embedded_under={parent.id}"
+            elif clause.conn == "rel" and not clause.governor_lost:
+                link = "unattached"  # e.g. main predicate absorbed after a relative
+            else:
+                link = "embedded_under_unresolved_governor"
+        elif clause.conn == "quand":
+            link = "temporal_subordinate"  # no host chosen
+        elif clause.conn == "wh":
+            link = "wh_complement"
+        elif ci in protases:
+            link = "conditional_protasis"
+        elif clause.conn == "a_moins_que":
+            link = "exception_condition"  # held relation (H17), no host chosen
+        else:
+            cj = max((p for p in protases if p < ci), default=None)
+            if cj is not None and not any(cj < mj < ci for mj, _ in main_heads):
+                h = head_of(cj)
+                link = f"conditional_consequent_of={h.id}" if h is not None else "conditional_consequent"
+            elif clause.conn in {"mais", "puis", "et", "ou", "donc", "car", "alors", "apres", "avant_de", "apres_que"}:
+                prev_main = next((u for (mj, u) in reversed(main_heads) if mj < ci), None)
+                link = f"{clause.conn}_after={prev_main.id}" if prev_main is not None else clause.conn
+            else:
+                link = "root"
+        if clause.main_after_relative and clause.conn != "si" and clause.after_rel is not None \
+                and clause.after_rel.units and not clause.units:
+            # R1-R5: the antecedent's main predicate after a relative (verb not analysed)
+            link = f"main_predicate_after_relative_of={clause.after_rel.units[-1][0].id}"
+        ops = _content_operators(clause)
+        missing.append(f"{UNANALYZED_PREDICATIVE_CONTENT}:{content[0].start}-{content[-1].end}:{link}"
+                       + (f":governed_by={governed_by.id}" if governed_by is not None else "")
+                       + (f":ops={','.join(ops)}" if ops else ""))
+        if (clause.main_after_relative or clause.conn == "si") and not clause.units \
+                and clause.evidential_span is not None:
+            # F-EV: the source / evidential of an unresolved main predicate is kept, as a
+            # detached source of that unresolved content (never silently dropped); NF2: so is
+            # the source of an unresolved protasis ("Si, selon Marie, le script échoue, ...")
+            missing.append(f"{UNANALYZED_PREDICATIVE_CONTENT}:{clause.evidential_span[0]}-"
+                           f"{clause.evidential_span[1]}:detached_source_of="
+                           f"unresolved:{content[0].start}-{content[-1].end}:source={clause.evidential}")
+
+    for (g_start, g_end), uid in lost_governors:
+        missing.append(f"{UNANALYZED_PREDICATIVE_CONTENT}:{g_start}-{g_end}:unrecognized_governor_of={uid}")
+
+    # "Lance R si Paul valide P": a postposed "si" + proper-noun subject + unknown word opens
+    # no clause (no known verb); the protasis content is reported, never silently dropped
+    # (no unit, no CONDITIONS target invented; R is not left looking unconditional)
+    for clause in clauses:
+        for k in range(1, len(clause.toks)):
+            if clause.toks[k].low != "si":
+                continue
+            rest = [t for t in clause.toks[k + 1:] if not t.is_punct]
+            if len(rest) >= 2 and raw[rest[0].start:rest[0].start + 1].isupper() and not rest[0].analyses \
+                    and rest[0].low.isalpha() and rest[1].low.isalpha() and rest[1].low not in _CONNECTIVES \
+                    and not any(_is_verb(clause.toks, j) for j in range(k + 1, len(clause.toks))):
+                missing.append(f"{UNANALYZED_PREDICATIVE_CONTENT}:{rest[0].start}-{rest[-1].end}:conditional_protasis")
+                break
+
+    # H14 / D5-F1: "Paul et Nadia lancent P": "et" / "ou" split a coordinated subject. Its
+    # members are kept as one argument CoordinationRef (construction coordinated_subject) on
+    # the ONE unit: no group entity, no event per participant. A floating "chacun" is the
+    # explicit distributivity of that subject, never the subject replacing its members.
+    # With a speech-act person ("moi", "toi") the agent reading stays undecided (blocker kept).
+    for ci in range(len(clauses) - 1):
+        c0, c1 = clauses[ci], clauses[ci + 1]
+        conj = [x.low for x in c1.conn_toks]
+        if c0.units or not c0.toks or c0.conn not in {None, "si", "que"} or not c1.units                 or conj not in (["et"], ["ou"]):
+            continue
+        np0 = list(c0.toks)
+        while np0 and np0[0].low in _SUBJECT_INTRODUCERS:
+            np0 = np0[1:]
+        u1, d1 = c1.units[0]
+        pre = [t for t in c1.toks[:d1.head_index] if t.low not in {"ne", "n'"}]
+        # "chacun" before the verb, inside its chain or right after it (see _floating_each)
+        each = [t for t in c1.toks[:d1.head_index] if t.low in _DISTRIBUTIVE_FLOATS]
+        floating, reread = _floating_each(c1.toks, d1, u1)
+        pre = [t for t in pre if t.low not in _DISTRIBUTIVE_FLOATS]
+        head = c1.toks[d1.head_index]
+        covered = any(m.split(":")[1] == f"{c0.toks[0].start}-{c0.toks[-1].end}" for m in missing)
+        tonic = (["moi"], ["toi"])
+        # "Paul, Nadia et Luc": every comma member before the conjunction is a member too
+        # (never only the last one)
+        firsts: list[list] = [[]]
+        for t in np0:
+            if t.low == ",":
+                firsts.append([])
+            else:
+                firsts[-1].append(t)
+        members = firsts + [pre]
+        persons = [_TONIC_AGENT.get(t[0].low) if [x.low for x in t] in tonic else "THIRD_PARTY" for t in members if t]
+        if covered or not all(m and (_bare_noun_phrase(m) or [t.low for t in m] in tonic) for m in members) \
+                or d1.head_index == 0 or not (_plural_verb(head) or conj == ["ou"]):
+            continue
+        # D5-R3: members of more than one agent class ("toi et moi", "Paul et moi") have no
+        # truthful single action_agent: UNKNOWN (no MIXED value) and the agency stays open
+        mixed = len(set(persons)) > 1
+        if floating is not None:
+            each.append(floating)
+            if reread is not None:
+                u1 = replace(u1, objects=tuple(reread))
+        person = mixed or "THIRD_PARTY" not in persons
+        texts = tuple(" ".join(t.low for t in m if t.low not in _DETERMINERS) or m[-1].low for m in members)
+        links = (",",) * (len(members) - 2) + (conj[0],)
+        coordinations.append(CoordinationRef(
+            f"c{len(coordinations) + 1}", "OR" if conj == ["ou"] else "AND",
+            tuple(f"{u1.id}.s{n}" for n in range(1, len(members) + 1)),
+            "coordinated_subject", links, (np0[0].start, pre[-1].end), member_kind="argument",
+            host=u1.id, role="subject", member_texts=texts,
+            member_spans=tuple((m[0].start, m[-1].end) for m in members),
+            distributivity="EXPLICIT" if each else "UNSPECIFIED"))
+        if each:
+            # canonical carrier; CoordinationRef.distributivity above is its legacy mirror
+            _configure(u1.id, "DISTRIBUTIVE", each[0].low, (each[0].start, each[0].end), coordinations[-1].id)
+        u1 = replace(u1, subject=f" {conj[0]} ".join(texts))
+        if mixed:
+            u1 = replace(u1, action_agent="UNKNOWN",
+                         role="MENTION" if u1.role == "THIRD_PARTY_ACTION" else u1.role)
+        c1.units[0] = (u1, d1)
+        # D3: members that shared this subject ("Paul et Nadia ont lancé P et ont lancé Q") hold
+        # the whole coordinated subject, never its last member
+        for c2 in clauses:
+            if c2.shared_subject_host is c1 and c2.units:
+                u2, d2 = c2.units[0]
+                c2.units[0] = (replace(u2, subject=u1.subject, action_agent=u1.action_agent), d2)
+        if person:
+            missing.append(f"coordinated_subject_unrepresented:{np0[0].start}-{np0[-1].end}:subject_of={u1.id}")
+            ambiguities.append(f"coordinated_subject_unrepresented:{u1.id}")
+
+    # R4: "Paul et Nadia qui testent P lancent Q": the main predicate after the relative has the
+    # coordinated antecedent as subject, kept as the canonical H14 coordinated_subject
+    # CoordinationRef (no group entity, distributivity unspecified)
+    for clause in clauses:
+        if not clause.main_subject_members or not clause.units:
+            continue
+        members, conj = clause.main_subject_members
+        mu, md = clause.units[0]
+        if md.subject != clause.main_subject:
+            continue
+        texts = tuple(" ".join(t.low for t in m if t.low not in _DETERMINERS) or m[-1].low for m in members)
+        coordinations.append(CoordinationRef(
+            f"c{len(coordinations) + 1}", "OR" if conj == "ou" else "AND",
+            tuple(f"{mu.id}.s{n}" for n in range(1, len(members) + 1)), "coordinated_subject",
+            (",",) * (len(members) - 2) + (conj,), (members[0][0].start, members[-1][-1].end),
+            member_kind="argument", host=mu.id, role="subject", member_texts=texts,
+            member_spans=tuple((m[0].start, m[-1].end) for m in members), distributivity="UNSPECIFIED"))
+
+    # D5-N4: a floating "chacun" of a plural NON-coordinated subject ("Ils lancent chacun P",
+    # "Les agents ont chacun lancé P"): the object is restored and the distributivity is a
+    # ParticipantConfigurationRef (no group); "ils" stays unresolved (no anaphora here)
+    hosts = {c.host for c in coordinations if c.construction == "coordinated_subject"}
+    for clause in clauses:
+        for i, (u, d) in enumerate(clause.units):
+            if u.id in hosts or u.subject is None or not _plural_verb(clause.toks[d.head_index]):
+                continue
+            floating, reread = _floating_each(clause.toks, d, u)
+            if floating is None:
+                continue
+            if reread is not None:
+                clause.units[i] = (replace(u, objects=tuple(reread)), d)
+            _configure(u.id, "DISTRIBUTIVE", floating.low, (floating.start, floating.end))
+
+    # D5-N7 (provisional, fail-closed): manner material around a unit's arguments ("P tout
+    # seul", "P vite", "vite P", "tout seul") has no positive carrier yet: it is reported with
+    # its span, never fused into the object nor dropped; the frame stays open
+    for clause in clauses:
+        heads = sorted(d.head_index for _, d in clause.units)
+        for u, d in clause.units:
+            stop = next((h for h in heads if h > d.lex_index), len(clause.toks))
+            covered = [a.span for a in u.objects if a.span is not None]
+            k = d.lex_index + 1
+            while k < stop:
+                t = clause.toks[k]
+                if t.is_punct:
+                    break
+                manner = t.low in _MANNER_MARKED or (
+                    t.low == "tout" and k + 1 < stop and clause.toks[k + 1].low in _MANNER_MARKED)
+                if not manner or any(a <= t.start < b for a, b in covered):
+                    k += 1
+                    continue
+                end = k
+                while end + 1 < stop and clause.toks[end + 1].low in _MANNER_MARKED:
+                    end += 1
+                cue = " ".join(x.low for x in clause.toks[k:end + 1])
+                span = (t.start, clause.toks[end].end)
+                plural = u.id in hosts or _plural_verb(clause.toks[d.head_index])
+                group = next((c.id for c in coordinations
+                              if c.construction == "coordinated_subject" and c.host == u.id), None)
+                if cue == "ensemble" and plural and u.subject is not None:
+                    _configure(u.id, "COLLECTIVE", cue, span, group)  # N13
+                elif cue == "tout seul" and not plural and u.subject is not None:
+                    # SOLO: an explicit singular subject realizes it alone. A bare "seul" may
+                    # mean "only P" and stays reported (never restriction=ONLY, never forced)
+                    _configure(u.id, "SOLO", cue, span)
+                else:
+                    if cue in _TYPED_MANNER:
+                        kind, value = _TYPED_MANNER[cue]
+                        manner_modifiers.append(MannerRef(f"m{len(manner_modifiers) + 1}", u.id, kind,
+                                                          value, cue, span))
+                    else:
+                        missing.append(f"{UNANALYZED_PREDICATIVE_CONTENT}:{t.start}-{clause.toks[end].end}"
+                                       f":unrepresented_modifier_of={u.id}")
+                    if u.polarity == "negative" and u.id not in negated_manner:
+                        # "ne lance pas vite P": the negation may bear on the modifier (P is
+                        # launched, not fast) or on the predicate: named, never chosen, and
+                        # never a confirmed no-execute nor a prohibition (as D5-N6 below)
+                        ambiguities.append(f"negated_scope_open:{u.id}")
+                        negated_manner.add(u.id)
+                k = end + 1
+
+    # N8: an object relative on the sentence-initial NP ("Le test que Paul lance échoue",
+    # "... est prêt", "... et que Marie observe échoue"): the relative verb's object slot is
+    # the antecedent (gap), so material after its last verb is never its object; that material
+    # is the main predicate of the antecedent, reported (never dropped, never an object)
+    if clauses and not clauses[0].units and _bare_noun_phrase(clauses[0].toks):
+        for ci, clause in enumerate(clauses[1:], start=1):
+            if clause.conn != "rel" or not clause.conn_toks or clause.conn_toks[-1].low not in {"que", "qu'"} \
+                    or not clause.units or any(c.conn != "rel" for c in clauses[1:ci]) \
+                    or any(c.after_rel is clause for c in clauses):   # (already split, R1-R5)
+                continue
+            last_u, last_d = clause.units[-1]
+            k = max(last_d.lex_index, last_d.head_index) + 1
+            rest = [t for t in clause.toks[k:] if not t.is_punct]
+            if not rest or any(int(m.split(":")[1].split("-")[0]) < rest[-1].end
+                               and rest[0].start < int(m.split(":")[1].split("-")[1])
+                               for m in missing if m.count(":") >= 2 and "-" in m.split(":")[1]):
+                continue   # already reported (e.g. "unattached" after a compound relative)
+            clause.units[-1] = (replace(last_u, objects=tuple(a for a in last_u.objects
+                                                              if a.span is None or a.span[0] < rest[0].start)), last_d)
+            missing.append(f"{UNANALYZED_PREDICATIVE_CONTENT}:{rest[0].start}-{rest[-1].end}"
+                           f":main_predicate_after_relative_of={last_u.id}")
+            clause.toks = clause.toks[:k]
+        # N7: a verb coordinated inside a subject "qui" relative keeps its own objects; what
+        # follows them is the antecedent's main predicate ("... et exécute Q est prêt"): reported
+        for clause in clauses[1:]:
+            if not clause.rel_member or not clause.units:
+                continue
+            last_u, last_d = clause.units[-1]
+            end = max([a.span[1] for a in last_u.objects if a.span is not None] + [last_d.lex.end])
+            rest = [t for t in clause.toks if t.start >= end and not t.is_punct]
+            if rest and not any(m.endswith(f"_of={last_u.id}") for m in missing):
+                missing.append(f"{UNANALYZED_PREDICATIVE_CONTENT}:{rest[0].start}-{rest[-1].end}"
+                               f":main_predicate_after_relative_of={last_u.id}")
+                clause.toks = [t for t in clause.toks if t.start < end or t.is_punct]
+        # N7: a subject relative on the sentence-initial NP whose main predicate was found nowhere
+        # (no unit of the antecedent, nothing reported after the relative) keeps the frame open
+        ante = " ".join(t.low for t in clauses[0].toks if t.low not in _DETERMINERS)
+        rels = [c for c in clauses[1:] if c.conn == "rel" or c.rel_member]
+        if rels and len(rels) == len(clauses) - 1 and rels[0].conn_toks and rels[0].conn_toks[-1].low == "qui" \
+                and not any(u.subject == ante for c in rels for (u, _) in c.units) \
+                and not any("main_predicate_after_relative_of=" in m or m.endswith(":unattached") for m in missing):
+            missing.append(f"{UNANALYZED_PREDICATIVE_CONTENT}:{clauses[0].toks[0].start}-{clauses[0].toks[-1].end}"
+                           f":main_predicate_unresolved")
+    # R1-R5: any subject antecedent (also after "si" or a source marker) whose main predicate was
+    # not found after its relative chain keeps the frame open, named (never a silent closure)
+    for clause in clauses:
+        if clause.rel_main_unresolved and clause.toks:
+            marker = (f"{UNANALYZED_PREDICATIVE_CONTENT}:{clause.toks[0].start}-{clause.toks[-1].end}"
+                      f":main_predicate_unresolved")
+            if marker not in missing:
+                missing.append(marker)
+
+    # D5-N3 / S11 conservation: material left right after a unit's objects (or after its verb
+    # when it has none) and consumed by no structure is reported, never dropped silently:
+    # nominal ("le test de Marie", "aucun des tests") or prepositional ("avec Q", "sur le
+    # serveur", "en utilisant ta mémoire", "à partir du document X"). Its role (source,
+    # instrument, location...) is not decided here: the exact span is kept, the frame stays open
+    heads_of = {id(c): {i for _, d in c.units for i in (d.head_index, d.lex_index)} for c in clauses}
+    for clause in clauses:
+        for u, d in clause.units:
+            spans = [a.span for a in u.objects if a.span is not None]
+            if spans:
+                k = next((i for i, t in enumerate(clause.toks) if t.start >= max(e for _, e in spans)), None)
+            else:
+                k = d.lex_index + 1
+                while k < len(clause.toks) and clause.toks[k].low in _FR_NEGATORS | _ADVERBS_SKIPPABLE:
+                    k += 1
+            def _next_remainder(end: int, clause=clause) -> int | None:
+                # the next remainder after a comma ("Lance P avec Q, puis R"), never past a unit head
+                i = end + 1
+                while i < len(clause.toks) and clause.toks[i].low == ",":
+                    i += 1
+                return i if i < len(clause.toks) and i not in heads_of[id(clause)] else None
+
+            while k is not None:
+                if k is None or k + 1 >= len(clause.toks):
+                    break
+                first = clause.toks[k].low
+                if _is_verb(clause.toks, k):
+                    break  # "a échoué": "a" is the auxiliary, not the preposition "à"
+                if first == "au" and k + 1 < len(clause.toks) and clause.toks[k + 1].low == "moyen":
+                    link = "unattached_prepositional_of"  # "au moyen de X" (contracted "à le")
+                elif first in _DETERMINERS:
+                    link = "unattached_nominal_of"
+                elif first in _PREPOSITIONS or first in _OBJECT_BOUNDARY_PREPOSITIONS or (first=="comme" and u.lemma=="présenter"):
+                    link = "unattached_prepositional_of"
+                elif first in _RELATIVE_PRONOUNS:
+                    # "la mémoire qui te sert à parler": a relative with no recognised verb was merged
+                    # into the clause and dropped; its content is kept (no antecedent, subject or
+                    # predicate inferred)
+                    link = "unattached_relative_of"
+                elif first == "si":
+                    # "Lance R si P", "Lance R si possible": a verbless protasis opens no clause;
+                    # the condition is kept as reported content (never dropped, H11), no
+                    # CONDITIONS relation invented (it needs a unit), frame open
+                    link = "conditional_protasis_of"
+                elif first in {"puis", "mais", "then", "but"}:  # "car"... have their own reporting
+                    # "Lance P puis R": a verbless connective tail (R) was dropped with a closed frame;
+                    # kept as reported content, no sequence relation invented (PRECEDES needs units)
+                    link = "unattached_connective_content_of"
+                else:
+                    break
+                nxt = clause.toks[k + 1]
+                if link != "unattached_relative_of" and (nxt.is_punct or nxt.low in _CONNECTIVES or _is_verb(clause.toks, k + 1)
+                                                         or k + 1 in heads_of[id(clause)]):
+                    break  # "pour tester Q", "à lancer P": an infinitive unit consumes it
+                end = k + 1
+
+                def _continues(i: int, clause=clause) -> bool:
+                    # nominal material of the same clause; a connective only when more of it follows
+                    # ("à partir de ta mémoire et du document X"), never a new predication
+                    t = clause.toks[i]
+                    if t.low in {"et", "ou", ","}:
+                        return i + 1 < len(clause.toks) and _continues(i + 1)
+                    return not t.is_punct and t.low not in _CONNECTIVES and not _is_verb(clause.toks, i) \
+                        and i not in heads_of[id(clause)]
+                while end + 1 < len(clause.toks) and _continues(end + 1):
+                    end += 1
+                if link == "conditional_protasis_of" and any(
+                        int(m.split(":")[1].split("-")[0]) < clause.toks[end].end
+                        and clause.toks[k].start < int(m.split(":")[1].split("-")[1])
+                        for m in missing if m.startswith(f"{UNANALYZED_PREDICATIVE_CONTENT}:")):
+                    break  # already reported (unknown-verb protasis)
+                parsed = _oblique_members(clause.toks, k, end) if link == "unattached_prepositional_of" else None
+                if parsed is None:
+                    missing.append(f"{UNANALYZED_PREDICATIVE_CONTENT}:{clause.toks[k].start}-{clause.toks[end].end}"
+                                   f":{link}={u.id}")
+                    k = _next_remainder(end)
+                    continue
+                # ObliqueArgumentRef V0: the S11 fallback is replaced, never duplicated
+                marker, licensed, args, links = parsed
+                kinds = {"OR" if x == "ou" else "AND" for x in links if x != ","}
+                if len(kinds) > 1 or (links and links[-1] == "," and len(args) > 1 and not kinds):
+                    missing.append(f"{UNANALYZED_PREDICATIVE_CONTENT}:{clause.toks[k].start}-{clause.toks[end].end}"
+                                   f":{link}={u.id}")  # mixed "et / ou": precedence not written
+                    k = _next_remainder(end)
+                    continue
+                group = None
+                if len(args) > 1:
+                    group = f"c{len(coordinations) + 1}"
+                    coordinations.append(CoordinationRef(
+                        group, kinds.pop() if kinds else "AND",
+                        tuple(f"{u.id}.x{len(oblique_arguments) + n + 1}" for n in range(len(args))),
+                        "coordinated_oblique", tuple(links), (args[0].span[0], args[-1].span[1]),
+                        member_kind="argument", host=u.id, role="oblique",
+                        member_texts=tuple(a.text for a in args), member_spans=tuple(a.span for a in args)))
+                for n, a in enumerate(args):
+                    # SOURCE never over a temporal cue ("à partir de demain"): no guessed temporal relation
+                    role = "UNRESOLVED" if licensed == "SOURCE" and a.reference == "DEICTIC" else licensed
+                    start = clause.toks[k].start if n == 0 else a.span[0]
+                    oblique_arguments.append(ObliqueArgumentRef(
+                        f"b{len(oblique_arguments) + 1}", u.id, role, marker, a, (start, a.span[1]), group))
+                k = _next_remainder(end)
+
+    final_units = [u for c in clauses for (u, _) in c.units]
+    final_units, ref_relations, unresolved, presupposed, ambiguous_refs = _resolve_references(final_units)
+    relations.extend(ref_relations)
+    ambiguities.extend(ambiguous_refs)
+
+    ambiguities.extend(_occurrence_conflict_candidates(clauses))
+    # H01: one "ne ... pas / plus / jamais" over coordinated objects ("ne lance pas P et Q"):
+    # ¬(P∧Q), ¬P∧¬Q or another reading is not fixed by syntax -> named, never chosen
+    # ("ni ... ni" is the explicit distributive form and is not concerned)
+    for u in final_units:
+        if u.polarity == "negative" and u.negator in {"pas", "plus", "jamais"} and len(u.objects) >= 2 \
+                and all(a.span is not None for a in u.objects[:2]) \
+                and raw[u.objects[0].span[1]:u.objects[1].span[0]].strip().lower() in {"et", "ou"}:
+            ambiguities.append(f"negated_scope_open:{u.id}")
+
+    # D5-F2: "lance P ou Q" / "lance P et Q": one unit, its coordinated objects keep their
+    # connective (OR never collapses to AND; no branch chosen; no event per object). A mixed
+    # "P et Q ou R" has no written precedence: named, not resolved.
+    for u in final_units:
+        args = [a for a in u.objects if a.span is not None]
+        if len(args) < 2 or len(args) != len(u.objects):
+            continue
+        links = [raw[a.span[1]:b.span[0]].strip().lower() for a, b in zip(args, args[1:])]
+        if not all(x in {"et", "ou", ",", ", et", ", ou"} for x in links) or links[-1] == ",":
+            continue
+        kinds = {"OR" if "ou" in x else "AND" for x in links if x != ","}
+        if len(kinds) > 1:
+            ambiguities.append(f"coordination_attachment_ambiguous:{u.id}")
+            continue
+        coordinations.append(CoordinationRef(
+            f"c{len(coordinations) + 1}", kinds.pop(), tuple(f"{u.id}.o{k}" for k in range(1, len(args) + 1)),
+            "coordinated_object", tuple(links), (args[0].span[0], args[-1].span[1]), member_kind="argument",
+            host=u.id, role="object", member_texts=tuple(a.text for a in args),
+            member_spans=tuple(a.span for a in args)))
+
+    # D5-N6: "ne ... pas tout / tous les X" is NOT ALL, never NONE: the negated scope over a
+    # totality object is open (H01), the negation is not a confirmed no-execute, and no
+    # prohibition is issued over that object
+    not_all = set()
+    for i, u in enumerate(final_units):
+        if u.polarity == "negative" and u.negator in {"pas", "plus", "jamais"} and u.objects                 and u.objects[0].text.split(" ", 1)[0] in _TOTALITY_QUANTIFIERS:
+            ambiguities.append(f"negated_scope_open:{u.id}")
+            not_all.add(u.id)
+            final_units[i] = replace(u, negation_confirmed=False)
+        elif u.id in negated_manner:
+            not_all.add(u.id)
+            final_units[i] = replace(u, negation_confirmed=False)
+
+    # SERVE_FOR covers "servir à + INF" only. Another sense ("sert le repas", "sert de preuve")
+    # is reported, never closed as a functional purpose; a dative clitic ("te sert à") has no
+    # role yet (beneficiary / user / controller undecided) and is kept, frame open
+    drafts_of = {u.id: (c, d) for c in clauses for (u, d) in c.units}
+    for u in final_units:
+        if u.predicate != "SERVE_FOR" or u.id not in drafts_of:
+            continue
+        c, d = drafts_of[u.id]
+        if not any(r.source == u.id and r.evidence == "servir_a" for r in relations):
+            missing.append(f"{UNANALYZED_PREDICATIVE_CONTENT}:{u.span[0]}-{u.span[1]}:serve_for_sense_unsupported_of={u.id}")
+        k = d.head_index - 1
+        while k >= 0 and c.toks[k].low in {"ne", "n'"}:
+            k -= 1
+        if k >= 0 and c.toks[k].low in {"me", "te", "lui", "nous", "vous", "leur", "m'", "t'"}:
+            missing.append(f"{UNANALYZED_PREDICATIVE_CONTENT}:{c.toks[k].start}-{c.toks[k].end}:unresolved_clitic_of={u.id}")
+
+    # SPEAK: a "de X" / "du fait" complement is not an object (no TOPIC role exists yet): it
+    # is kept as reported content and the frame stays open ("Paul parle de KX108")
+    for i, u in enumerate(final_units):
+        if u.predicate != "SPEAK":
+            continue
+        de_args = [a for a in u.objects if a.span is not None
+                   and (a.text.split(" ", 1)[0] in {"de", "du", "des"} or a.text.startswith("d'"))]
+        if de_args:
+            final_units[i] = replace(u, objects=tuple(a for a in u.objects if a not in de_args))
+            missing.extend(f"{UNANALYZED_PREDICATIVE_CONTENT}:{a.span[0]}-{a.span[1]}:speak_complement_of={u.id}"
+                           for a in de_args)
+
+    # O2: the subject of a "qui" relative is its antecedent only when syntax proves it: the
+    # carrier right before "qui" ends with exactly one grammar-built nominal Argument adjacent
+    # to the opening. Never the nearest / first / last noun: otherwise subject_ref stays None
+    by_id = {u.id: i for i, u in enumerate(final_units)}
+    for ci, clause in enumerate(clauses):
+        if clause.conn != "rel" or clause.governor_lost or ci == 0 or not clause.conn_toks \
+                or clause.conn_toks[0].low != "qui":
+            continue
+        ids = {u.id for (u, _) in clause.units}
+        # the relative's own top-level predicate (not content embedded inside the relative)
+        heads = [final_units[by_id[u.id]] for (u, d) in clause.units if u.id in by_id
+                 and d.subject is None and final_units[by_id[u.id]].embedded_under not in ids]
+        ante, rivals = _relative_antecedent(raw, clauses[ci - 1], clause.conn_toks[0], final_units)
+        if len(heads) == 1 and rivals:
+            ambiguities.append(f"ambiguous_antecedent:{heads[0].id}:qui:" + ",".join(rivals))
+        if len(heads) != 1 or ante is None:
+            continue
+        final_units[by_id[heads[0].id]] = replace(heads[0], subject_ref=ante)
+
+    # Known FAIRE does not settle the function of a single bare nominal /
+    # adjectival complement. Preserve it, with an explicit open construction;
+    # never infer appearance, production, tone, or a world occurrence.
+    for i,u in enumerate(final_units):
+        if u.lemma!="faire" or len(u.objects)!=1:continue
+        a=u.objects[0]
+        if a.kind!="NP" or a.span is None:continue
+        surface=raw[a.span[0]:a.span[1]]
+        if len(surface)<=1 or not surface.split():continue
+        if surface.split()[0].casefold() in _DETERMINERS | _PRONOUN_OBJECTS_EN | _TOTALITY_QUANTIFIERS:continue
+        # No positive construction license exists here. Neither capitalization
+        # nor missing corpus evidence can turn an unresolved function into a
+        # resolved production. Preserve the bare argument and fail closed.
+        missing.append(f"{UNANALYZED_PREDICATIVE_CONTENT}:{a.span[0]}-{a.span[1]}:unresolved_faire_function_of={u.id}")
+        final_units[i]=replace(u,epistemic=UNRESOLVED_GOVERNANCE)
+
+    # With no nominal attestation, a finite homograph after FAIRE is not
+    # automatically a licensed second instruction. Retain both analyses open.
+    for i in range(len(final_units)-1):
+        u,v=final_units[i:i+2]
+        if (u.lemma=="faire" and not u.objects and v.clause==u.clause
+                and v.verb_form in {"FINITE","IMPERATIVE","PARTICIPLE"}):
+            end=max([v.span[1]]+[a.span[1] for a in v.objects if a.span])
+            missing.append(f"{UNANALYZED_PREDICATIVE_CONTENT}:{v.span[0]}-{end}:unresolved_faire_function_of={u.id}")
+            final_units[i]=replace(u,epistemic=UNRESOLVED_GOVERNANCE)
+            final_units[i+1]=replace(v,epistemic=UNRESOLVED_GOVERNANCE)
+
+    constraints = _constraints([u for u in final_units if u.id not in not_all])
+    contradictions = _contradictions(final_units)
+    evidence = _evidence_needs(final_units)
+
+    if interrogative:
+        surface = "interrogative"
+    elif any(u.verb_form == "IMPERATIVE" and u.embedded_under is None for u in final_units):
+        surface = "imperative"
+    elif final_units:
+        surface = "declarative"
+    else:
+        surface = "none"
+
+    # Preserve both nominal/verbal constructions under the existing unresolved
+    # subject contract; do not turn the alternative into a resolved request.
+    ambiguities.extend('subject_unresolved:bare_nominal_or_verbal:'+str(t.start)+':'+str(t.end)
+                       for t in toks if t.nominal_subject_evidence
+                       and t.nominal_subject_evidence['status']=='AMBIGUOUS')
+    frame = UtteranceFrame(
+        raw=raw,
+        normalized=normalized,
+        units=tuple(final_units),
+        relations=tuple(relations),
+        constraints=tuple(constraints),
+        surface_act=surface,
+        unresolved_references=tuple(unresolved),
+        presupposed_referents=tuple(presupposed),
+        deixis=tuple(deixis),
+        ambiguities=tuple(dict.fromkeys(ambiguities)),
+        contradictions=tuple(contradictions),
+        evidence_needs=tuple(evidence),
+        missing=tuple(missing),
+        disfluencies=tuple(disfluencies),
+        orthography_flags=tuple(dict.fromkeys(ortho)),
+        coordinations=tuple(coordinations),
+        operator_scopes=tuple(operator_scopes),
+        participant_configurations=tuple(participant_configurations),
+        oblique_arguments=tuple(oblique_arguments),
+        manner_modifiers=tuple(manner_modifiers),
+    )
+    held = _unresolved_profile_complements(frame)
+    if held:
+        frame = replace(frame, ambiguities=frame.ambiguities + held)
+    projected = replace(frame, structural_analysis=_structural_language_projection(frame, toks, clauses))
+    projected.structural_analysis["language"] = "fr"
+    projected.structural_analysis["language_selection"] = (
+        "explicit_caller_argument" if language == "fr" else "default_legacy_french"
+    )
+    from .communication import project_communication
+    projected.structural_analysis['communication'] = project_communication(projected)
+    return projected
+
+
+def _unresolved_profile_complements(frame: UtteranceFrame) -> tuple[str, ...]:
+    """H04 closure policy: the governance of a KNOW / LEARN / PERCEPTION complement is
+    structurally complete IFF its commitment profile resolves under the governor's
+    operators (the occurrence layer's resolver is the authority); otherwise it is named
+    (closure blocker). Structural only: never truth, occurrence, verification or authority."""
+    from brody.linguistic.occurrence_projection import occurrence_projection
+
+    projection = occurrence_projection(frame)
+    return tuple(f"unresolved_complement_governance:{u.id}" for u in frame.units
+                 if projection.profiled_complement_unresolved(u, families={"KNOW", "LEARN", "OBSERVE", "EXPLAIN"})
+                 and f"unresolved_complement_governance:{u.id}" not in frame.ambiguities)
+
+
+def _mark_governed(clause: _Clause, d: _Draft, pol: dict) -> None:
+    """Classify infinitive roles that mention an action without requesting it."""
+    lows = [t.low for t in clause.toks]
+    if d.governed in {"negated_scope_open", "know_how_scope_open", "unknown_governor", "subject_unresolved",
+                      "deontic_scope_open"}:
+        return
+    if clause.ni_scope_open is not None and d.verb_form == "INFINITIVE" and d.head_index > 0 \
+            and lows[d.head_index - 1] == "ni" and d.modality is None and d.subject is None:
+        # "ne voudrait ni INF": bound to that exact "vouloir" token, never to a nearest unit
+        d.governed = "negated_scope_open"
+        d.governor_span = (clause.ni_scope_open.start, clause.ni_scope_open.end)
+        return
+    if d.unresolved_governor and d.verb_form == "INFINITIVE":
+        # Unknown "que" governor under a modal / aspectual: MODAL(G(X)), the
+        # modal unit governs G, never flattened into G(X) or X.
+        prior = [u for (u, dd) in clause.units if dd.lex_index < d.lex_index]
+        if prior and prior[-1].predicate_class in {"modal", "aspectual"}:
+            d.governed = "modal_governor"
+            d.governor_unit = prior[-1].id
+        return
+    if (clause.conn in {"avant_de", "apres"} or any(x in {"après", "apres", "before", "after"} for x in lows[:d.lex_index])) and d.verb_form in {"INFINITIVE", "PARTICIPLE"}:
+        d.governed = "temporal"
+        return
+    if d.verb_form in {"INFINITIVE", "PARTICIPLE"}:
+        prior = [u for (u, dd) in clause.units if dd.lex_index < d.head_index]
+        if prior and prior[-1].predicate == "OBSERVE":
+            d.governed = "observation_target"
+            d.governor_unit = prior[-1].id
+            return
+    if d.verb_form != "INFINITIVE" or d.lex_index != d.head_index:
+        return
+    if _unknown_finite_governor(clause, d):
+        # A bare complement with no admitted governance is never a new injunction
+        d.governed = "unknown_governor"
+        return
+    j = d.lex_index - 1
+    skip = _OBJECT_CLITICS | _REFLEXIVE_CLITICS | {"ne", "n'", "pas", "rien", "jamais", "plus", "avoir"}
+    while j >= 0 and lows[j] in skip:
+        j -= 1
+    if j < 0:
+        return
+    if lows[j] in _WH_WORDS or (lows[j] in {"de", "d'", "à", "to"} and j > 0
+                                and lows[j - 1] in _WH_WORDS):
+        d.governed = "wh"
+        return
+    if lows[j] in {"pour", "for"}:
+        d.governed = "purpose"
+        return
+    if lows[j] in {"de", "d'", "à", "to"} and j > 0:
+        if lows[j - 1] in {"droit", "permission"}:
+            d.governed = "permission"
+            speaker = next((x for x in lows[:j] if x in _FIRST_PERSON), None)
+            if speaker is not None:
+                d.subject = speaker
+                d.subject_person = "1"
+            return
+        if lows[j - 1] == "besoin":
+            return
+        d.governed = "prep"
+        prior = [u for (u, dd) in clause.units if dd.lex_index < j]
+        d.governor_unit = prior[-1].id if prior else None
+        d.governor_negated = bool(pol.get("governor_negated")) or bool(
+            prior and prior[-1].polarity == "negative")
+
+
+def _unknown_finite_governor(clause: _Clause, d: _Draft) -> bool:
+    """A bare infinitive under a finite governor without admitted governance.
+
+    The host may be lexically unknown OR an attested finite non-operator
+    without an existing complement contract. The historical unknown-governor
+    marker names that missing governance, not lexical absence of AIMER/etc.
+    Its source can include written ne / pas / ni. The second ni member keeps
+    the exact governor; interjections and hyphenated tokens are not inferred
+    as a governor or subject. No new semantic license or authority is created.
+    """
+    toks, lows = clause.toks, [t.low for t in clause.toks]
+    g = d.lex_index - 1
+    if g >= 0 and lows[g] == "ni" and any(dd.governed == "unknown_governor" for (_, dd) in clause.units):
+        return True
+    while g >= 0 and lows[g] in _OBJECT_CLITICS | _REFLEXIVE_CLITICS | {"ne", "n'", "pas", "plus", "jamais", "ni"}:
+        g -= 1
+    if g < 1 or toks[g].hyphen_before or lows[g] in _INTERJECTIONS:
+        return False
+    # Lexical attestation does not supply a complement-governance contract.
+    # A finite non-operator followed directly by a bare infinitive keeps the
+    # existing open-governor contract; it must not turn its content into a
+    # new imperative simply because the corpus now recognizes the host word.
+    known_open=(_is_verb(toks,g) and _cls(toks[g]) not in {'modal','aux','aspectual'}
+                and bool(_feats(toks[g]) & {'PRES','SUBJ','IMPF','FUT','COND','PAST_SIMPLE','PST'})
+                and _subject_before(toks,g)[0] is not None)
+    if not (_content_word(toks[g]) or known_open):return False
+    s = g - 1
+    while s >= 0 and lows[s] in {"ne", "n'"}:
+        s -= 1
+    found = s >= 0 and lows[s] not in _INTERJECTIONS and not toks[s].hyphen_before and (
+        lows[s] in _SUBJECT_PRONOUNS | _DEMONSTRATIVE_SUBJECTS or _content_word(toks[s]))
+    if found:
+        d.governor_span = (toks[g].start, toks[g].end)   # surface of the unrecognised governor
+    return found
+
+
+def _oral_head_negator(toks: list[_Tok], d: _Draft) -> int | None:
+    """"Tu peux pas lancer P", "Paul doit pas lancer P": index of an oral negator (no "ne")
+    right after the finite head of a chain (after its hyphenated clitic), before the
+    lexical verb; None when there is none or a written "ne" frames the head."""
+    if d.head_index == d.lex_index or any(t.low in {"ne", "n'"} for t in toks[:d.head_index]):
+        return None
+    j = d.head_index + 1
+    while j < d.lex_index and toks[j].hyphen_before:
+        j += 1
+    if j < d.lex_index and toks[j].low in _ORAL_NEGATORS and not (
+            j + 1 < len(toks) and toks[j].low == "pas" and toks[j + 1].low in {"à", "a", "besoin"}):
+        return j
+    return None
+
+
+def _negates_operator(toks: list[_Tok], d: _Draft) -> bool:
+    """The negation of this chain frames its finite head (the question / modal operator),
+    not its lexical infinitive: "ne peux-tu pas lancer" vs "peux-tu ne pas lancer". A member
+    sharing an operator from another clause ("peux-tu arrêter P et ne pas lancer Q ?")
+    carries its own negation."""
+    if d.modal_tok is not None and not any(t is d.modal_tok for t in toks):
+        return False
+    if _oral_head_negator(toks, d) is not None:
+        return True     # "tu peux pas (ne pas) lancer": the oral negation frames the operator
+    return not any(t.low in {"ne", "n'"} for t in toks[d.head_index + 1:d.lex_index])
+
+
+def _action_agent(u: PredicateUnit, d: _Draft, prag: str) -> str:
+    if d.subject_person == "1":
+        return "SPEAKER"
+    if d.subject_person == "2":
+        return "ADDRESSEE"
+    if d.subject_person == "3":
+        return "THIRD_PARTY"
+    if d.subject_person == "impersonal":
+        return "IMPERSONAL"
+    if d.subject is None and prag in {"REQUESTED", "INDIRECT_REQUEST", "FORBIDDEN"}:
+        return "ADDRESSEE"
+    return "UNKNOWN"
+
+
+def _role(u: PredicateUnit, d: _Draft, prag: str, interrogative: bool) -> str:
+    if u.polarity == "negative":
+        return "NEGATED"
+    if d.possible_request:
+        return "REQUEST"   # EMBEDDED + REQUEST: possible request, never semantic REQUESTED
+    if prag == "REPORTED":
+        return "REPORTED"
+    if prag == "BELIEVED":
+        return "BELIEVED"
+    if prag == "HYPOTHETICAL":
+        return "HYPOTHETICAL"
+    if d.governed == "wh":
+        return "EXPLANATION_CONTENT"
+    if d.governed == "purpose":
+        return "PURPOSE"
+    if d.governed == "temporal":
+        return "TEMPORAL_CONTEXT"
+    if d.governed == "permission":
+        return "PERMISSION_QUERY"
+    if d.governed == "unknown_prep":
+        return "REQUEST"
+    if prag == "REQUESTED":
+        return "REQUEST"
+    if prag == "INDIRECT_REQUEST":
+        return "AMBIGUOUS_REQUEST"
+    if d.subject_person == "1" and u.modality == "DESIRE":
+        return "DESIRE_ASSERTION"
+    if d.subject_person == "1" and (interrogative or u.modality == "ABILITY_OR_PERMISSION"):
+        return "PERMISSION_QUERY"
+    if d.subject_person == "3" and u.predicate_class == "world_action":
+        return "THIRD_PARTY_ACTION"
+    if u.predicate_class == "world_action":
+        return "MENTION"
+    return "OTHER"
+
+
+def _request_target(u: PredicateUnit, agent: str, prag: str, role: str) -> str:
+    if u.polarity != "positive" or u.predicate_class != "world_action":
+        return "NONE"
+    if role == "REQUEST" and prag in {"REQUESTED", "EMBEDDED"} and agent in {"ADDRESSEE", "UNKNOWN", "IMPERSONAL"}:
+        return "ADDRESSEE"
+    if role == "AMBIGUOUS_REQUEST" and prag == "INDIRECT_REQUEST" and agent == "ADDRESSEE":
+        return "ADDRESSEE_OR_POSSIBLE_ADDRESSEE"
+    if role == "AMBIGUOUS_REQUEST" and prag == "INDIRECT_REQUEST" and agent == "IMPERSONAL" \
+            and u.modality == "OBLIGATION":
+        # "Faut-il lancer P ?" (question channel only): its possible request may be the
+        # addressee's; no other impersonal clause is retargeted
+        return "ADDRESSEE_OR_POSSIBLE_ADDRESSEE"
+    return "NONE"
+
+def _ability_speech_act(d: _Draft, interrogative: bool) -> str:
+    """Speech act carried by an ability-permission modal, from its own context."""
+    if d.subject_person == "2" and (interrogative or d.politeness) and not d.compound_modal:
+        return "INDIRECT_REQUEST"
+    return "QUESTION" if interrogative else "NONE"
+
+
+def _main_pragmatics(u: PredicateUnit, d: _Draft, interrogative: bool,
+                     ambiguities: list[str]) -> tuple[str, str]:
+    person = d.subject_person
+    if d.compound_modal:
+        # a past modal ("tu as dû lancer P", "il a fallu lancer P") is never a directive
+        return ("ASKED", "UNKNOWN") if interrogative else ("ASSERTED", "ASSERTED")
+    if d.directive:
+        # one written directive operator scopes over its (coordinated) infinitives
+        return "REQUESTED", "NOT_APPLICABLE"
+    if u.modality == "ABILITY_OR_PERMISSION":
+        act = _ability_speech_act(d, interrogative)
+        if act == "INDIRECT_REQUEST":
+            ambiguities.append(f"ability_permission_or_request:{u.id}")
+            return "INDIRECT_REQUEST", "NOT_APPLICABLE"
+        return ("ASKED", "UNKNOWN") if act == "QUESTION" else ("ASSERTED", "ASSERTED")
+    if u.modality == "OBLIGATION":
+        if interrogative and person in {"2", "impersonal"}:
+            # "Dois-tu / Faut-il lancer P ?", "Ne faut-il pas lancer P ?": a question about an obligation
+            # or a request: fail-closed channel, never a definitive request or prohibition
+            ambiguities.append(f"question_or_request:{u.id}")
+            return "INDIRECT_REQUEST", "NOT_APPLICABLE"
+        if person in {"2", "impersonal"} or d.subject is None:
+            return "REQUESTED", "NOT_APPLICABLE"
+        return ("ASKED", "UNKNOWN") if interrogative else ("ASSERTED", "ASSERTED")
+    if u.modality == "DESIRE":
+        if person == "1":
+            ambiguities.append(f"desire_or_request:{u.id}")
+        elif interrogative and person == "2":
+            # H09: "Veux-tu / Tu veux lancer P ?": a question about a desire or an invitation
+            # (request): both readings kept, the possible request keeps its gate
+            ambiguities.append(f"desire_or_request:{u.id}")
+            return "INDIRECT_REQUEST", "NOT_APPLICABLE"
+        return ("ASKED", "UNKNOWN") if interrogative else ("ASSERTED", "ASSERTED")
+    if u.modality == "KNOW_HOW":
+        return ("ASKED", "UNKNOWN") if interrogative else ("ASSERTED", "ASSERTED")
+    if (interrogative and person == "2" and u.tense_aspect == "PRESENT"
+            and u.predicate_class == "world_action"):
+        # "tu lances le script ?" — literal question or request: fail-closed.
+        ambiguities.append(f"question_or_request:{u.id}")
+        return "INDIRECT_REQUEST", "NOT_APPLICABLE"
+    if u.verb_form == "IMPERATIVE":
+        return "REQUESTED", "NOT_APPLICABLE"
+    if u.verb_form == "INFINITIVE" and d.subject is None:
+        # injunctive infinitive ("lancer le script") or "va lancer"
+        return "REQUESTED", "NOT_APPLICABLE"
+    if interrogative:
+        return "ASKED", "UNKNOWN"
+    return "ASSERTED", "ASSERTED"
+
+
+_PLURAL_DETS = {"les", "des", "ces", "mes", "tes", "ses", "nos", "vos", "leurs", "aux"}
+_FEMININE_DETS = {"la", "une", "cette", "ma", "ta", "sa"}
+_MASCULINE_DETS = {"le", "un", "ce", "cet", "mon", "ton", "son", "du", "au"}
+
+
+def _agrees_with_antecedent(pronoun: str, det: str | None) -> bool:
+    """Number / gender agreement of an object pronoun with an NP determiner (unknown: compatible)."""
+    if det is None or pronoun not in {"le", "la", "l'", "les"}:
+        return True
+    if pronoun == "les":
+        return det in _PLURAL_DETS
+    if det in _PLURAL_DETS:
+        return False
+    return not ((pronoun == "le" and det in _FEMININE_DETS) or (pronoun == "la" and det in _MASCULINE_DETS))
+
+
+def _relative_antecedent(raw: str, carrier: _Clause, qui: _Tok,
+                         units: list[PredicateUnit]) -> tuple[Argument | None, list[str]]:
+    """O2: the nominal Argument the grammar built at the end of the carrier, adjacent to
+    "qui" ("la mémoire qui"), as a RESOLVED_INTRA reference. One distinct Argument or
+    None (fail closed), with the rival heads when coordinated nominals end the carrier ("le
+    script et le document qui"): the relative may hold the last conjunct or the whole
+    coordination, so it is named, never chosen."""
+    if not carrier.toks or raw[carrier.toks[-1].end:qui.start].strip():
+        return None, []
+    end = carrier.toks[-1].end
+    if carrier.units:
+        own = {u.id for (u, _) in carrier.units}
+        found = {(a, u.id) for u in units if u.id in own for a in u.objects
+                 if a.kind == "NP" and a.span is not None and a.span[1] == end}
+        args = {a for a, _ in found}
+        if len(args) != 1:
+            return None, []
+        hosts = {h for _, h in found}
+        arg, host = args.pop(), (next(iter(hosts)) if len(hosts) == 1 else None)
+        rivals = [a for u in units if u.id in hosts for a in u.objects if a != arg]
+        if rivals:
+            return None, [a.head for a in rivals] + [arg.head]
+    else:
+        # verbless carrier ("La mémoire qui sert à parler"): it must be exactly one NP
+        arg, nj = _np_from(carrier.toks, 0)
+        if arg is None or arg.kind != "NP" or nj != len(carrier.toks):
+            return None, []
+        host = None
+    return replace(arg, reference="RESOLVED_INTRA", antecedent=arg.head, antecedent_unit=host), []
+
+
+def _resolve_references(units: list[PredicateUnit]):
+    """Intra-utterance anaphora (then cataphora) for pronoun objects.
+
+    Only antecedents agreeing with the pronoun count; a unique one resolves it,
+    several distinct ones leave it open (never the nearest), none leaves it open.
+    """
+    candidates: list[tuple[int, str, str, str | None]] = []  # (position, head, unit id, determiner)
+    for u in units:
+        for a in u.objects:
+            if a.kind in {"NP", "NEGATIVE_QUANTIFIER"} and a.head != "*":
+                first = a.text.split()[0] if a.text.split() else ""
+                det = first if first in _DETERMINERS else ("l'" if a.text.startswith("l'") else None)
+                candidates.append(((a.span or u.span)[0], a.head, u.id, det))
+    relations: list[LatticeRelation] = []
+    unresolved: list[str] = []
+    presupposed: list[str] = []
+    ambiguous: list[str] = []
+    out: list[PredicateUnit] = []
+    for u in units:
+        new_args = []
+        for a in u.objects:
+            if a.reference == "UNRESOLVED" and a.kind == "PRONOUN":
+                pos = (a.span or u.span)[0]
+                agree = [c for c in candidates if _agrees_with_antecedent(a.text, c[3])]
+                before = [c for c in agree if c[0] < pos]
+                after = [c for c in agree if c[0] > pos]
+                pool = before or after
+                ante = pool[-1] if before else (pool[0] if pool else None)
+                # several distinct agreeing antecedents ("le test ... le build ... le"):
+                # never the nearest; the reference stays open (no nearest match)
+                rivals = {(c[0], c[1]) for c in pool}
+                if not pool and a.text == "les":
+                    # "le test et le build ... les": only a collective reading of the
+                    # coordinated singulars would agree; it stays open (named, not chosen)
+                    raw = [c for c in candidates if c[0] < pos] or [c for c in candidates if c[0] > pos]
+                    host = raw[-1][2] if raw and raw[0][0] < pos else (raw[0][2] if raw else None)
+                    rivals = {(c[0], c[1]) for c in raw if c[2] == host}
+                if len(rivals) > 1:
+                    ambiguous.append(f"ambiguous_antecedent:{u.id}:{a.text}:"
+                                     + ",".join(h for _, h in sorted(rivals)))
+                    ante = None
+                if ante is not None:
+                    a = replace(a, reference="RESOLVED_INTRA", antecedent=ante[1],
+                                antecedent_unit=ante[2])
+                    if ante[2] != u.id:
+                        relations.append(LatticeRelation(RelationKind.REFERS_TO.value, u.id,
+                                                         ante[2], confidence=0.8,
+                                                         evidence=f"{a.text}->{ante[1]}"))
+            if a.reference == "UNRESOLVED":
+                unresolved.append(f"{u.id}:{a.text}")
+            if a.reference == "PRESUPPOSED":
+                presupposed.append(a.head)
+            new_args.append(a)
+        out.append(replace(u, objects=tuple(new_args)))
+    return out, relations, unresolved, list(dict.fromkeys(presupposed)), ambiguous
+
+
+def _heads(u: PredicateUnit) -> list[str]:
+    heads = []
+    for a in u.objects:
+        if a.reference == "RESOLVED_INTRA" and a.antecedent:
+            heads.append(a.antecedent)
+        elif a.reference != "UNRESOLVED":
+            heads.append(a.head)
+    return heads or ["*"]
+
+
+def _constraints(units: list[PredicateUnit]) -> list[str]:
+    out: list[str] = []
+    for u in units:
+        if u.pragmatic == "FORBIDDEN" and u.polarity == "negative":
+            out += [f"NO_{u.predicate}({h})" for h in _heads(u)]
+        if u.pragmatic == "PREVENTED":
+            out += [f"PREVENT_{u.predicate}({h})" for h in _heads(u)]
+        if u.restriction == "ONLY" and u.polarity == "positive":
+            out += [f"ONLY_{u.predicate}({h})" for h in _heads(u)]
+    return list(dict.fromkeys(out))
+
+
+def _occurrence_conflict_candidates(clauses: list[_Clause]) -> list[str]:
+    """"Paul a lancé P et Paul n'a pas lancé P": two root assertions whose clauses are the
+    same words except "ne ... pas" (same subject, verb form, object, adjuncts). Both claims
+    are kept as they are; the pair is only named as a possible occurrence conflict
+    (temporal / perspective / contradiction resolution is held doctrine, H06). A pair that
+    differs in anything else (pronoun subject, tense, adjunct...) is never compared.
+    """
+    rows = []
+    for c in clauses:
+        if len(c.units) != 1 or c.conn not in {None, "et", "mais"}:
+            continue
+        u = c.units[0][0]
+        if u.pragmatic != "ASSERTED" or u.embedded_under is not None:
+            continue
+        if u.polarity == "negative" and not (u.negation_confirmed and u.negator == "pas"):
+            continue
+        conn = {id(t) for t in c.conn_toks}
+        # D4: the subject is compared as the unit's subject, written or shared ("Paul a lancé P
+        # et n'a pas lancé P"), never as surface words
+        subj = set((u.subject or "").split())
+        sig = (u.subject, tuple(t.low for t in c.toks if id(t) not in conn
+                                and t.low not in {"ne", "n'", "pas"} | subj))
+        rows.append((sig, u))
+    out = []
+    for i, (sig_a, a) in enumerate(rows):
+        for sig_b, b in rows[i + 1:]:
+            if sig_a == sig_b and {a.polarity, b.polarity} == {"positive", "negative"}:
+                out.append(f"occurrence_conflict_open:{a.id}:{b.id}")
+    return out
+
+
+def _contradictions(units: list[PredicateUnit]) -> list[str]:
+    out = []
+    requested = [u for u in units if u.pragmatic in {"REQUESTED", "INDIRECT_REQUEST"}
+                 and u.polarity == "positive"]
+    forbidden = [u for u in units if u.pragmatic == "FORBIDDEN" and u.polarity == "negative"]
+    for r in requested:
+        for f in forbidden:
+            if r.predicate != f.predicate:
+                continue
+            rh, fh = set(_heads(r)), set(_heads(f))
+            if rh & fh or "*" in fh:
+                out.append(f"{r.predicate}({sorted(rh & fh or rh)[0]}):requested_and_forbidden:"
+                           f"{r.id}/{f.id}")
+    return out
+
+
+def _evidence_needs(units: list[PredicateUnit]) -> list[str]:
+    out = []
+    for u in units:
+        if u.pragmatic != "ASKED" or u.tense_aspect not in {"PRESENT", "NONE"}:
+            continue
+        if u.predicate == "BE_PRESENT":
+            out.append(f"current_world_observation:BE_PRESENT({u.subject or '?'})")
+        elif u.predicate == "WEATHER":
+            out.append("current_world_observation:WEATHER")
+    return out
+
+
+def project_editorial_brief(frame):
+    """Bounded editorial projection of the SAME parsed PredicateUnits.
+
+    Not an independent parser: lexical forms, subject and goal come from this
+    frame. Unsupported or ambiguous topics are reported, not completed.
+    """
+    import unicodedata
+    def fold(text):
+        return "".join(c for c in unicodedata.normalize("NFKD",text.lower()) if not unicodedata.combining(c))
+    toks,_,_=_tokenize(frame.raw)
+    tokens=[fold(t.low) for t in toks]
+    write=[u for u in frame.units if u.predicate=="WRITE" and u.predicate_class=="text_production" and u.polarity=="positive" and u.pragmatic in {"REQUESTED","INDIRECT_REQUEST"} and u.embedded_under is None]
+    uses=[u for u in frame.units if u.lemma=="utiliser"]
+    gains=[u for u in frame.units if u.lemma=="gagner" and any("temps" in a.text for a in u.objects)]
+    domain=[u for u in uses if any(fold(a.head) in {"ia","intelligence"} for a in u.objects)]
+    actors=[u.subject for u in domain if u.subject and "entreprise" in u.subject and "petite" in u.subject]
+    platform="linkedin" if "linkedin" in tokens else None
+    ambiguous=("ou" in tokens or len(domain)>1 or len(write)!=1
+               or any(u.polarity!="positive" for u in frame.units if u.predicate=="WRITE" or u in domain+gains)
+               or bool(frame.contradictions)
+               or any(u.predicate in {"SAY","REPORT","QUOTE"} and write and u.span[0]<write[0].span[0] for u in frame.units))
+    subject={"actor":actors[0],"predicate":"utiliser","object":"IA","goal":"gagner du temps",
+             "unit_ids":[u.id for u in domain+gains]} if actors and gains else None
+    # Audience is a transparent contextual projection from actor, not a default.
+    audience={"label":"responsables de petites entreprises","basis":"SUBJECT_ACTOR",
+              "source_unit_ids":[u.id for u in domain]} if actors else None
+    legacy = {"editorial_intent":"consultative_draft" if write else None,
+            "subject":subject,"audience":audience,"platform":platform,
+            "constraints":{"low_budget":any(tokens[i:i+2]==["sans","budget"] or tokens[i:i+3]==["sans","gros","budget"] for i in range(len(tokens))),
+                           "time_saving":bool(gains),"draft_only":True},
+            "ambiguous":ambiguous,"supported":bool(write and subject and audience and platform and not ambiguous),
+            "source":"french_grammar.PredicateUnits","non_sovereign":True}
+
+    if legacy["supported"]:
+        return legacy
+    return _project_semantic_editorial_brief(frame, write, platform, ambiguous, legacy)
+
+
+def _project_semantic_editorial_brief(frame, write, platform, ambiguous, legacy):
+    """Project predicate relations, without inferring world truth or an audience.
+
+    Unknown spans remain visible. This projection only certifies structural
+    coverage; composition must independently have relevant native operations.
+    """
+    import re
+    def text(value):
+        return re.sub(r"([ldjnmtsc])' +", r"\1'", value)
+    def argument(a):
+        # Restore source orthography before realization, never repair a draft.
+        # Case alone is not lexical/conceptual/factual verification.
+        normalized=text(a.text)
+        raw=frame.raw[a.span[0]:a.span[1]] if a.span else ''
+        if text(raw.replace('’', "'")).casefold()==normalized.casefold():
+            normalized=text(raw)
+        return {'head':a.head,'text':normalized,'source_span':list(a.span) if a.span else None,
+                'reference':a.reference,'antecedent':a.antecedent,'antecedent_unit':a.antecedent_unit}
+    from brody.linguistic.primitives import source_class
+    relations=[]
+    for u in frame.units:
+        if u.predicate=='WRITE' or (u.predicate=='EXPLAIN' and not u.objects):
+            continue
+        relations.append({'unit_id':u.id,'lemma':u.lemma,'predicate':u.predicate,
+            'subject':u.subject,'objects':[argument(a) for a in u.objects],
+            'polarity':u.polarity,'pragmatic':u.pragmatic,'embedded_under':u.embedded_under,
+            'role':u.role,'epistemic':u.epistemic,'predicate_class':u.predicate_class,
+            'purpose_host':(u.embedded_under if u.role=='PURPOSE' and any(
+                r.kind=='EMBEDS' and r.source==u.embedded_under and r.target==u.id for r in frame.relations) else None),
+            'source_class':source_class(u).value if source_class(u) is not None else None,
+            'span':list(u.span),'obliques':[{'id':b.id,'role':b.role,'marker':b.marker,'argument':{'text':b.argument.text,'head':b.argument.head}} for b in frame.oblique_arguments if b.unit==u.id],
+            'factual_status':'BRIEF_RELATION_NOT_VERIFIED'})
+    content=[r for r in relations if r['polarity']=='positive' and r['objects']]
+    first=content[0] if content else None
+    goals=[r for r in content if first and r['unit_id']!=first['unit_id']
+           and r['role']=='PURPOSE' and (r.get('purpose_host')==first['unit_id'] or r['embedded_under']==first['embedded_under'])
+           and r['subject'] in {None,first['subject']}]
+    goal=(goals[0] if len(goals)==1 else None) if first and first['lemma']=='utiliser' else first
+    def infinitive(r):
+        parts=[a['text'] for a in r['objects']]
+        obj=(', '.join(parts[:-1])+' et '+parts[-1]) if len(parts)>1 else ''.join(parts)
+        return r['lemma']+(' '+obj if obj else '')
+    subject=({'main_unit_id':first['unit_id'],'actor':first['subject'],'predicate':first['lemma'],
+        'object':' / '.join(a['text'] for a in first['objects']),
+        'goal':infinitive(goal) if goal else None,'unit_ids':[r['unit_id'] for r in relations],
+        'relations':relations,'knowledge_status':'UNVERIFIED_BRIEF_RELATIONS'} if first else None)
+    source_tokens,_,_=_tokenize(frame.raw)
+    requires_explanation=any(t.low=='pourquoi' for t in source_tokens)
+    missing=list(frame.missing)
+    if any(r['source_class'] is not None or r['predicate_class'].startswith('embedding')
+           or r['predicate'] in {'SAY','REPORT','QUOTE','BELIEVE','THINK','SUPPOSE'} for r in relations):
+        missing.append('EDITORIAL_SOURCE_SCOPE_UNRESOLVED')
+    scoped_forbidden={r.target for r in frame.relations if r.kind=='FORBIDS' and (any(r.source==w.id for w in write) or (first is not None and r.source==first['unit_id']))}
+    unresolved_obliques=['UNRESOLVED_OBLIQUE:'+b.id for b in frame.oblique_arguments if b.role=='UNRESOLVED']
+    missing+=unresolved_obliques
+    return {'editorial_intent':'consultative_draft' if write else None,
+        'subject':subject,'audience':legacy['audience'],'platform':platform,
+        'constraints':{**legacy['constraints'],'requires_explanation':requires_explanation,'negative_relation_ids':[r['unit_id'] for r in relations if r['polarity']=='negative' and r['pragmatic']=='FORBIDDEN' and r['unit_id'] in scoped_forbidden],
+                       'source_unknowns':missing},
+        'ambiguous':ambiguous,'supported':bool(len(write)==1 and subject and platform and not ambiguous and not missing),
+        'source':'french_grammar.PredicateUnits','non_sovereign':True,
+        'topic_kind':'SEMANTIC_RELATIONS','unknowns':missing+([] if legacy['audience'] else ['AUDIENCE_NOT_SPECIFIED'])}
+
+def requested_explanation_question_binding(raw, units, governor):
+    """REQUESTED_EXPLANATION_WH_V1: a bounded source-construction witness.
+
+    An imperative WRITE with ONE NP object immediately modified by the positive
+    EXPLAIN gerund, followed by 'comment'. This identifies a question in a
+    requested text. It identifies no human emitter, truth or realized event.
+    Narrative/negative/modal/future/conditional contexts have no fallback.
+    """
+    import re
+    if not isinstance(raw,str):return None
+    def norm(value):return re.sub(r"\b([ldjnmtsc])'\s+",r"\1'",' '.join(value.replace('’',"'").split()).casefold())
+    def span_valid(span):
+        return (isinstance(span,(tuple,list)) and len(span)==2 and all(type(x) is int for x in span)
+                and 0<=span[0]<span[1]<=len(raw))
+    if (governor.predicate!='EXPLAIN' or governor.verb_form!='GERUND' or governor.polarity!='positive'
+            or governor.modality is not None or governor.tense_aspect!='NONE'
+            or governor.embedded_under is not None or not span_valid(governor.span)
+            or norm(raw[governor.span[0]:governor.span[1]])!=norm(governor.surface)
+            or not re.match(r'\s+comment\b',raw[governor.span[1]:],re.IGNORECASE)):
+        return None
+    writes=[u for u in units if u.predicate=='WRITE']
+    if len(writes)!=1:return None
+    write=writes[0]
+    if (write.polarity!='positive' or write.verb_form!='IMPERATIVE' or write.role!='REQUEST'
+            or write.pragmatic!='REQUESTED' or write.modality is not None or write.tense_aspect!='NONE'
+            or write.embedded_under is not None or write.clause!=0 or not span_valid(write.span)
+            or raw[:write.span[0]].strip() or norm(raw[write.span[0]:write.span[1]])!=norm(write.surface)
+            or len(write.objects)!=1):return None
+    obj=write.objects[0]
+    if (obj.kind!='NP' or norm(obj.head).split(' ',1)[0] not in {'publication','article','texte'}
+            or write.predicate_class!='text_production' or not span_valid(obj.span) or write.span[1]>obj.span[0]
+            or raw[write.span[1]:obj.span[0]].strip()
+            or obj.span[1]>governor.span[0] or governor.clause!=write.clause
+            or raw[obj.span[1]:governor.span[0]].strip()
+            or norm(raw[obj.span[0]:obj.span[1]])!=norm(obj.text)
+            or not isinstance(governor.subject,str) or norm(governor.subject)!=norm(obj.head)):
+        return None
+    return {'contract':'REQUESTED_EXPLANATION_WH_V1','request_unit':write.id,
+            'object_span':list(obj.span),'governor_unit':governor.id,'governor_span':list(governor.span),
+            'interpretation':'QUESTION_CONSIDERED_NOT_ASSERTED','human_emitter':None,
+            'verified_fact':False,'occurrence_asserted':False,'authority_created':False}
+
+
+_NOMINAL_AGREEMENT_RULE_SPECS = {
+    'corpus_morphological_alternatives':('corpus noun and adjective gender/number alternatives','NOUN_ADJECTIVE assessment','any supported agreement; unavailable evidence stays UNKNOWN','lookup_surface_form'),
+    'written_determiner_and_corpus_noun_alternatives':('written determiner and attested noun alternatives','DETERMINER_NOUN assessment','number/gender compatibility is grammar only','lookup_surface_form'),
+}
+
+
+def _assess_noun_adjective_agreement(noun_readings, adjective_readings):
+    """Existing P1 rule, reusable for one or several morphological witnesses."""
+    pairs = [(h, a) for h in noun_readings for a in adjective_readings if h.get('number') and a.get('number')]
+    compatible = any(h['number'] == a['number'] and (not h.get('gender') or not a.get('gender') or h['gender'] == a['gender']) for h,a in pairs)
+    return 'COMPATIBLE' if compatible else ('INCOMPATIBLE' if pairs else 'UNKNOWN')
+
+
+def _assess_determiner_noun_agreement(determiner, noun_readings):
+    """Existing P1 determiner rule. Missing morphology is not incompatibility."""
+    dn=None if determiner in {'de',"d'"} else ('pl' if determiner in _PLURAL_DETS else 'sg')
+    dg='f' if determiner in _FEMININE_DETS else ('m' if determiner in _MASCULINE_DETS else None)
+    hs=[a for a in noun_readings if a.get('number')]
+    possible=bool(dn or dg) and any((not dn or a['number']==dn) and (not dg or not a.get('gender') or a['gender'][:1]==dg) for a in hs)
+    return 'COMPATIBLE' if possible else ('INCOMPATIBLE' if hs and (dn or dg) else 'UNKNOWN')
+
+
+def _qualify_nominal_construction(prefix, determiner):
+    """Attested categories constrain Det Adj* N Adj*, without resolving sense.
+
+    Lexicographic categories positively support an analysis. They never prove
+    that the other morphological readings or substantivations are impossible.
+    """
+    from hashlib import sha256
+    from brody.linguistic.lexical_corpus import get_senses_and_synonyms, corpus_identity
+    try:
+        identity=corpus_identity()
+        if identity.get('status')!='READY':return []
+        cache={}
+        def pos(value):
+            return {'nom':'noun','adj':'adjective'}.get(str(value).lower(),str(value).lower())
+        def refs(record,wanted):
+            out=[]
+            for lemma in sorted({a['lemma'] for a in record['nature_analyses'] if pos(a['pos'])==wanted}):
+                if lemma not in cache:cache[lemma]=get_senses_and_synonyms(lemma,lang='fr')
+                senses=cache[lemma]
+                # The existing API is bounded. A saturated page is not a
+                # complete basis for choosing one of competing analyses.
+                if len(senses)>=20:return []
+                for sense in senses:
+                    if (sense.kind=='definition' and sense.lemma==lemma and sense.lang=='fr' and pos(sense.pos)==wanted and sense.definition
+                            and sense.source_id and sense.sense_id):
+                        out.append(dict(lemma=lemma,pos=wanted,source_id=sense.source_id,
+                            sense_id=sense.sense_id,definition_sha256=sha256(sense.definition.encode('utf-8')).hexdigest()))
+            return out
+        def gender(value):
+            if not value:return None
+            return str(value).lower()[0] if str(value).lower()[0] in {'m','f'} else None
+        def number(value):return value if value in {'sg','pl'} else None
+        dn=(None if determiner in {'de',"d'"} else ('pl' if determiner in _PLURAL_DETS else 'sg')) if determiner in _DETERMINERS else None
+        dg='f' if determiner in _FEMININE_DETS else ('m' if determiner in _MASCULINE_DETS else None)
+        def compatible(reading,n,g):
+            return (not n or not number(reading.get('number')) or number(reading.get('number'))==n) and (
+                not g or not gender(reading.get('gender')) or gender(reading.get('gender'))==g)
+        candidates=[]
+        for head in prefix:
+            unknown=head.get('lexical_status')=='UNATTESTED'
+            nouns=[a for a in head['nature_analyses'] if pos(a['pos'])=='noun']
+            head_refs=[] if unknown else refs(head,'noun')
+            if not unknown and (not nouns or not head_refs):continue
+            others=[r for r in prefix if r is not head]
+            if not others:continue
+            modifier_refs={r['id']:refs(r,'adjective') for r in others}
+            if any(not modifier_refs[r['id']] for r in others):continue
+            supported=False;witness={};matched_head_refs=[];matched_modifiers={}
+            for reading in ([{}] if unknown else nouns):
+                if not compatible(reading,dn,dg):continue
+                current_refs=[e for e in head_refs if e['lemma']==reading.get('lemma')]
+                if not unknown and not current_refs:continue
+                n=number(reading.get('number')) or dn
+                g=gender(reading.get('gender')) or dg
+                qualified_modifiers={}
+                for r in others:
+                    lemmas={a.get('lemma') for a in r['nature_analyses']
+                            if pos(a['pos'])=='adjective' and compatible(a,n,g)}
+                    qualified_modifiers[r['id']]=[e for e in modifier_refs[r['id']] if e['lemma'] in lemmas]
+                if all(qualified_modifiers.values()):
+                    supported=True;witness=reading;matched_head_refs=current_refs
+                    matched_modifiers=qualified_modifiers;break
+            if not supported:continue
+            evidence=[dict(token_ref=head['id'],category='NOUN',references=matched_head_refs)] if matched_head_refs else []
+            evidence.extend(dict(token_ref=r['id'],category='ADJECTIVE',references=matched_modifiers[r['id']]) for r in others)
+            candidates.append(dict(token_ref=head['id'],head=head['normalized'],
+                modifier_token_refs=[r['id'] for r in others],unknown_head=unknown,
+                rule='DETERMINER_ADJECTIVES_NOUN_ADJECTIVES',evidence_refs=evidence,
+                morphological_witness={k:witness.get(k) for k in ['lemma','number','gender','source_id']},
+                status='SYNTACTIC_SLOT_ONLY' if unknown else 'GRAMMATICAL_CONSTRUCTION_SUPPORTED',
+                semantic_resolution=False,verified_fact=False,
+                morphological_alternatives_preserved=True,scope='THIS_NOMINAL_CONSTRUCTION_ONLY',
+                corpus_provenance=identity))
+        return candidates
+    except (OSError,RuntimeError,ValueError,KeyError):
+        return []
+
+
+def _meaning_construction_bindings(frame, toks, clauses, identity):
+    from brody.linguistic.lexical_corpus import lookup_surface_form
+    properties=[];relations=[]
+    if identity.get('status')!='READY':return properties,relations
+    by_id={u.id:u for u in frame.units}
+    # Same deontic adjective family already recognized by _build_drafts/H16;
+    # inflections and adjective/participle candidates come from the pinned corpus.
+    kinds={'obligatoire':'OBLIGATION','nécessaire':'NECESSITY','obligé':'OBLIGATION'}
+    finite_moods={'indicative','conditional','subjunctive'}
+    for ci,clause in enumerate(clauses):
+        ts=clause.toks
+        for k,t in enumerate(ts):
+            be=[r for r in lookup_surface_form(t.low,lang='fr') if r.pos=='verb' and r.lemma=='être' and r.mood in finite_moods]
+            if not be:continue
+            j=k+1
+            while j<len(ts) and ts[j].low in _FR_NEGATORS|_ADVERBS_SKIPPABLE:j+=1
+            if j+2>=len(ts) or ts[j+1].low not in {'de',"d'"}:continue
+            adjective=[r for r in lookup_surface_form(ts[j].low,lang='fr') if r.pos in {'adjective','adj','ADJ'} and r.lemma in kinds]
+            if not adjective:continue
+            families={kinds[r.lemma] for r in adjective}
+            if len(families)!=1:continue
+            v=j+2
+            while v<len(ts) and ts[v].low in _FR_NEGATORS|_OBJECT_CLITICS|_REFLEXIVE_CLITICS|{'ne',"n'"}:v+=1
+            if v>=len(ts) or not _is_verb(ts,v) or 'INF' not in _feats(ts[v]):continue
+            targets=[u for u,_ in clause.units if u.id in by_id and u.verb_form=='INFINITIVE' and u.span[0]<=ts[v].start and ts[v].end<=u.span[1]]
+            if len(targets)!=1:continue
+            # Reuse P1 negation on the COPULAR prefix only. Content negation is
+            # outside this prefix and cannot negate the modal property.
+            prefix=ts[:j+1];candidate=_Draft(ts[j],j,k,'PARTICIPLE' if 'PP' in _feats(ts[j]) else 'FINITE')
+            pol=_polarity(prefix,candidate,clause,[candidate])
+            polarity=pol['polarity']
+            if pol['ne_expletive'] or pol['restriction'] or (polarity=='negative' and not pol['negation_confirmed']):polarity='UNKNOWN'
+            # Preserve auxiliary/passive and category alternatives; this is a
+            # justified construction reading, never a world/authority claim.
+            properties.append(dict(kind=next(iter(families)),content_ref=targets[0].id,
+                copula_span=[t.start,t.end],property_span=[ts[j].start,ts[j].end],
+                complement_marker_span=[ts[j+1].start,ts[j+1].end],content_span=list(targets[0].span),
+                polarity=polarity,polarity_evidence=pol,clause_ref=ci,
+                interrogated=any(u.id in by_id and u.pragmatic in {'ASKED','INDIRECT_REQUEST'} for u,_ in clause.units),
+                property_evidence=[r.to_dict() for r in adjective],finite_evidence=[r.to_dict() for r in be],
+                alternatives=['ADJECTIVAL_STATE','PARTICIPIAL_EVENT_READING_PRESERVED'] if 'PP' in _feats(ts[j]) else ['ADJECTIVAL_STATE'],
+                source_rule='existing_copular_property_complement',
+                implementation='_build_drafts/_polarity/lookup_surface_form',
+                semantic_resolution=False,verified_fact=False))
+    for ci,clause in enumerate(clauses):
+        marker=[];previous=None
+        if clause.conn_toks and clause.conn_toks[0].low in {'que',"qu'"}:
+            q=clause.conn_toks[0]
+            preceding=[t for t in toks if t.end<=q.start]
+            if preceding and preceding[-1].low=='bien' and not frame.raw[preceding[-1].end:q.start].strip():
+                marker=[preceding[-1],q];previous=clauses[ci-1] if ci else None
+        elif clause.toks and clause.toks[0].low=='quoique':marker=[clause.toks[0]]
+        if not marker:continue
+        # A relative/condition/other event is not invented. Use only native
+        # subordinate and main predicates whose boundaries already exist.
+        sources=[u for u,_ in clause.units if u.id in by_id]
+        finite=[r for t in clause.toks for r in lookup_surface_form(t.low,lang='fr') if r.pos=='verb' and r.mood=='subjunctive']
+        if not sources or not finite:continue
+        preposed=previous is None or not previous.units
+        if preposed:
+            host=clauses[ci+1] if ci+1<len(clauses) else None
+            if host is None or host.boundary!=',' or host.conn is not None:continue
+            targets=[u for u,_ in host.units if u.id in by_id]
+        else:targets=[u for u,_ in previous.units if u.id in by_id]
+        if not targets:continue
+        unambiguous=preposed and len(sources)==1 and len(targets)==1 and not clause.attachment_ambiguous
+        # Postposed bien que can compete with adverbial bien + a complement.
+        # Keep that native alternative rather than asserting a unique attachment.
+        relations.append(dict(kind='CONCESSION' if unambiguous else 'CONNECTIVE_SCOPE_OPEN',
+            source_refs=[u.id for u in sources],target_refs=[u.id for u in targets],
+            marker_span=[marker[0].start,marker[-1].end],source_clause_ref=ci,
+            status='NATIVE_BOUND' if unambiguous else 'OPEN',
+            alternatives=[] if unambiguous else ['CONCESSIVE_SUBORDINATION','COMPLEMENT_WITH_ADVERBIAL_BIEN'],
+            source_rule='existing_clause_boundaries_concessive_connector',
+            implementation='_segment/_Clause/lookup_surface_form',
+            mood_evidence=[r.to_dict() for r in finite],semantic_resolution=False,verified_fact=False))
+    return properties,relations
+
+
+def _structural_language_projection(frame, toks, clauses):
+    """Project existing parser objects, never parse a second semantic interpretation.
+
+    Nature candidates come from the existing lexicon/corpus; functions come from
+    predicate/argument attachments. An unknown noun in a written NP slot remains
+    lexically/semantically unknown. This projection cannot close a frame or
+    authorize an action. All spans address the original expression.
+    """
+    import hashlib
+    from brody.linguistic.lexical_corpus import lookup_surface_form
+    from brody.linguistic.lexical_corpus import corpus_identity
+
+    nature_map = {'noun': 'NOUN', 'nom': 'NOUN', 'NOM': 'NOUN', 'verb': 'VERB',
+                  'adjective': 'ADJECTIVE', 'adj': 'ADJECTIVE', 'ADJ': 'ADJECTIVE',
+                  'adverb': 'ADVERB', 'adv': 'ADVERB', 'pronoun': 'PRONOUN',
+                  'determiner': 'DETERMINER', 'preposition': 'PREPOSITION',
+                  'conjunction': 'CONJUNCTION', 'interjection': 'INTERJECTION'}
+    try:
+        identity = corpus_identity()
+    except (OSError, RuntimeError):
+        identity = {'status': 'UNAVAILABLE'}
+    cache = {}
+    def readings(t):
+        if t.low not in cache:
+            try:
+                cache[t.low] = tuple(lookup_surface_form(t.low, lang='fr')) if identity.get('status') == 'READY' else ()
+            except (OSError, RuntimeError):
+                cache[t.low] = ()
+        return cache[t.low]
+
+    records, token_by_span = [], {}
+    for i, t in enumerate(toks):
+        rs = readings(t)
+        candidates = {nature_map.get(a.pos, 'UNKNOWN') for a in rs}
+        closed = set()
+        if t.is_punct: closed.add('PUNCTUATION')
+        if t.low in _DETERMINERS: closed.add('DETERMINER')
+        if t.low in _SUBJECT_PRONOUNS | _OBJECT_CLITICS | _REFLEXIVE_CLITICS | _DEMONSTRATIVE_PRONOUNS: closed.add('PRONOUN')
+        if t.low in _PREPOSITIONS: closed.add('PREPOSITION')
+        if t.low in _CONNECTIVES or t.low in {'que', "qu'", 'lorsque', 'lorsqu\''}: closed.add('CONJUNCTION')
+        if t.low in _MANNER_ADVERBS | _ADVERBS_SKIPPABLE | _TIME_ADVERBS: closed.add('ADVERB')
+        if t.low in _INTERJECTIONS: closed.add('INTERJECTION')
+        candidates |= closed
+        if not candidates: candidates.add('UNKNOWN')
+        # A first/second/third person written pronoun is not its finite homograph.
+        if t.low in _SUBJECT_PRONOUNS | _DEMONSTRATIVE_PRONOUNS:
+            selected = 'PRONOUN'
+        elif t.is_punct: selected = 'PUNCTUATION'
+        elif len(candidates) == 1 and 'VERB' not in candidates: selected = next(iter(candidates))
+        else: selected = 'UNKNOWN'
+        r = {'id': 't'+str(i+1), 'raw': frame.raw[t.start:t.end], 'normalized': t.low,
+             'span': [t.start, t.end], 'nature_candidates': sorted(candidates),
+             'nature_analyses': [dict(a.to_dict(), verified_fact=False) for a in rs],
+             'selected_nature': selected, 'functions': [],
+             'lexical_status': 'ATTESTED' if rs else ('CLOSED_CLASS' if closed else 'UNATTESTED'),
+             'semantic_status': 'UNKNOWN', 'morphological_alternatives': [
+                 {'lemma': lemma, 'features': sorted(feats)} for lemma, feats in t.analyses]}
+        if t.nominal_subject_evidence:
+            r['nominal_subject_evidence']=t.nominal_subject_evidence
+            r['morphological_alternatives']=t.nominal_subject_evidence['verbal_alternatives']
+        if t.nominal_object_evidence:
+            r['nominal_object_evidence']=t.nominal_object_evidence
+        records.append(r); token_by_span[(t.start, t.end)] = r
+    groups, dependencies, alternatives, unresolved, agreements = [], [], [], [], []
+    constituent_contrasts=[];nominal_fragments=[]
+    for t in toks:
+        e=t.nominal_subject_evidence
+        if e and e['status']=='AMBIGUOUS':
+            alternatives.append({'kind':'BARE_NOMINAL_OR_VERBAL','span':[t.start,t.end],
+                'readings':['NOMINAL_SUBJECT_WITH_FINITE_PREDICATE','VERBAL_PREDICATE_WITH_NOMINAL_COMPLEMENT'],
+                'selected_reading':None,'source_rule':e['rule'],
+                'following_finite_span':e['following_finite_span'],
+                'semantic_resolution':False,'verified_fact':False})
+    group_ids = {}
+    def selected_tokens(span):
+        return [r for r in records if span[0] <= r['span'][0] and r['span'][1] <= span[1]]
+    draft_by_unit = {unit.id: (clause, draft) for clause in clauses for unit, draft in clause.units}
+    pronoun_features = {'je': ('1', 'sg'), "j'": ('1', 'sg'), 'tu': ('2', 'sg'),
+        'il': ('3', 'sg'), 'elle': ('3', 'sg'), 'on': ('3', 'sg'),
+        'nous': ('1', 'pl'), 'vous': ('2', 'pl'), 'ils': ('3', 'pl'), 'elles': ('3', 'pl')}
+    def group(kind, span, function, parent, predicate=None, status='GROUNDED_IN_PARSE', head=None):
+        span = list(span)
+        members = selected_tokens(span)
+        g = {'id': 'g'+str(len(groups)+1), 'kind': kind, 'span': span,
+             'raw': frame.raw[slice(*span)], 'head': head, 'head_token_ref': None,
+             'function': function, 'parent': parent, 'children': [],
+             'source_rule': ('existing_predicate_span' if kind=='VP' else
+                             ('existing_argument_span' if kind in {'NP','PRONOUN','DEMONSTRATIVE'} else 'existing_parser_span_projection')),
+             'token_refs': [r['id'] for r in members], 'predicate_ref': predicate, 'status': status}
+        groups.append(g); group_ids[g['id']] = g
+        if parent is not None: group_ids[parent]['children'].append(g['id'])
+        for r in members:
+            if function not in {'UTTERANCE', 'CLAUSE', 'UNASSIGNED', 'VERBAL_PREDICATE'} and function not in r['functions']:
+                r['functions'].append(function)
+        return g
+    root = group('UTTERANCE', (0, len(frame.raw)), 'UTTERANCE', None)
+    clause_groups = {}
+    for i, c in enumerate(clauses):
+        cts = list(c.conn_toks)+list(c.toks)
+        if cts:
+            clause_groups[i] = group('CLAUSE', (min(t.start for t in cts), max(t.end for t in cts)),
+                                     'CLAUSE', root['id'])
+    # Clause embedding is inherited from PredicateUnit, never reconstructed by
+    # proximity. Preserve the segmented local extent while making the host's
+    # structural extent contain its explicit complement (including nested ones).
+    by_unit = {u.id:u for u in frame.units}
+    for cg in clause_groups.values(): cg['local_span']=list(cg['span'])
+    for u in frame.units:
+        host=by_unit.get(u.embedded_under)
+        child=clause_groups.get(u.clause)
+        parent=clause_groups.get(host.clause) if host else None
+        if not child or not parent or child is parent:continue
+        cursor=parent
+        seen={child['id']}
+        while cursor is not None and cursor['id'] not in seen:
+            seen.add(cursor['id']);cursor=group_ids.get(cursor['parent'])
+        if cursor is not None:continue
+        old=group_ids.get(child['parent'])
+        if old and child['id'] in old['children']:old['children'].remove(child['id'])
+        child['parent']=parent['id']
+        if child['id'] not in parent['children']:parent['children'].append(child['id'])
+        child['attachment_rule']='existing_predicate_embedded_under'
+    # Relative syntax has a native carrier even where no semantic
+    # RelationKind exists. Keep this descriptive graph separate from the
+    # unchanged semantic frame.relations. Never choose an antecedent by rank.
+    structural_clause_relations=[]
+    preposed_object_candidates={}
+    if identity.get('status') == 'READY':
+        for ci, c in enumerate(clauses):
+            if c.conn != 'rel' or not c.conn_toks or c.conn_toks[0].low not in {'que', "qu'"}:
+                continue
+            relatives=[u for u in frame.units if u.clause == ci]
+            if len(relatives) != 1 or relatives[0].objects:
+                continue
+            unit=relatives[0]
+            draft_info=draft_by_unit.get(unit.id)
+            if draft_info is None:
+                continue
+            source_clause, draft=draft_info
+            if not (draft.head_index < draft.lex_index and 0 <= draft.head_index < len(source_clause.toks)
+                    and 0 <= draft.lex_index < len(source_clause.toks)):
+                continue
+            auxiliary, participle=source_clause.toks[draft.head_index], source_clause.toks[draft.lex_index]
+            if _pred(auxiliary) != 'HAVE' or 'PP' not in _feats(participle):
+                continue
+            carriers=[]
+            for prev_i, prev in enumerate(clauses):
+                if prev_i >= ci or prev.units or not prev.toks:
+                    continue
+                arg, end=_np_from(prev.toks,0)
+                if arg is None or arg.kind != 'NP' or arg.span is None or end != len(prev.toks):
+                    continue
+                between=[t for t in toks if prev.toks[-1].end <= t.start < c.conn_toks[0].start]
+                if between or prev.toks[-1].end > c.conn_toks[0].start:
+                    continue
+                head_rows=[row for row in lookup_surface_form(arg.head or '',lang='fr')
+                           if row.pos.lower() in {'noun','nom'} and row.number]
+                # A written determiner can establish only its own number/gender
+                # features; noun identity and provenance remain corpus-bound.
+                det=prev.toks[0].low
+                det_features={'les':(None,'pl'),'des':(None,'pl'),'le':('masc','sg'),
+                              'un':('masc','sg'),'la':('fem','sg'),'une':('fem','sg')}.get(det)
+                if det_features:
+                    dg,dn=det_features
+                    expected={(row.gender if row.gender in {'fem','masc'} else dg,row.number)
+                              for row in head_rows if row.number==dn
+                              and (row.gender in {'fem','masc'} or dg in {'fem','masc'})}
+                else:
+                    expected={(row.gender,row.number) for row in head_rows
+                              if row.gender in {'fem','masc'} and row.number in {'sg','pl'}}
+                if not expected:
+                    continue
+                part_record=token_by_span.get((participle.start,participle.end))
+                observed={(row.get('gender'),row.get('number'))
+                          for row in (part_record or {}).get('nature_analyses',[])
+                          if row.get('pos')=='verb' and row.get('mood')=='participle'
+                          and row.get('tense')=='past' and row.get('gender') in {'fem','masc'}
+                          and row.get('number') in {'sg','pl'}}
+                if observed:
+                    carriers.append((prev_i,prev,arg,unit,auxiliary,participle,expected,observed,head_rows))
+            if len(carriers)==1:
+                preposed_object_candidates[ci]=carriers[0]
+    for ci,c in enumerate(clauses):
+        rg=clause_groups.get(ci)
+        if c.conn!='rel' or rg is None:continue
+        if ci in preposed_object_candidates:
+            continue
+        refs=[u for u in frame.units if u.clause==ci and u.subject_ref is not None and u.subject_ref.span]
+        spans={u.subject_ref.span for u in refs}
+        if len(spans)!=1:
+            unresolved.append({'kind':'RELATIVE_ATTACHMENT_UNRESOLVED','clause_ref':rg['id']})
+            continue
+        span=next(iter(spans))
+        structural_clause_relations.append({'kind':'RELATIVE_MODIFIES_NOMINAL','source':rg['id'],
+            'antecedent_span':list(span),'predicate_refs':[u.id for u in refs],
+            'source_rule':'existing_native_relative_structure','semantic_resolution':False})
+        resumed=[(j,other) for j,other in enumerate(clauses)
+                 if other.main_after_relative and other.after_rel is c and j in clause_groups]
+        if len(resumed)!=1:continue
+        mi,main_clause=resumed[0]
+        mg=clause_groups[mi]
+        carriers=[g for j,g in clause_groups.items() if j not in {ci,mi}
+                  and g['local_span'][0]<=span[0] and span[1]<=g['local_span'][1]]
+        if len(carriers)!=1:
+            unresolved.append({'kind':'RELATIVE_CARRIER_UNRESOLVED','clause_ref':rg['id'],'antecedent_span':list(span)})
+            continue
+        carrier=carriers[0]
+        # Existing semantic embedding wins in case of an incompatible parent.
+        # The descriptive relation remains inspectable without forced nesting.
+        attachable=all(g['parent'] in {root['id'],mg['id']} for g in (rg,carrier))
+        if attachable:
+            for child in (rg,carrier):
+                old=group_ids.get(child['parent'])
+                if old and child['id'] in old['children']:old['children'].remove(child['id'])
+                child['parent']=mg['id']
+                if child['id'] not in mg['children']:mg['children'].append(child['id'])
+                child['attachment_rule']='existing_native_relative_structure'
+        else:
+            unresolved.append({'kind':'RELATIVE_HIERARCHY_CONFLICT','clause_ref':rg['id']})
+        structural_clause_relations.append({'kind':'MAIN_RESUMES_ANTECEDENT','source':mg['id'],
+            'target':carrier['id'],'relative_clause_ref':rg['id'],'antecedent_span':list(span),
+            'source_rule':'existing_native_relative_structure','status':'SOURCE_BOUND' if attachable else 'UNRESOLVED',
+            'semantic_resolution':False})
+    for _ in range(len(clause_groups)):
+        for cg in clause_groups.values():
+            children=[group_ids[c] for c in cg['children'] if group_ids[c]['kind']=='CLAUSE']
+            cg['span']=[min([cg['span'][0]]+[c['span'][0] for c in children]),
+                        max([cg['span'][1]]+[c['span'][1] for c in children])]
+            cg['raw']=frame.raw[slice(*cg['span'])]
+            cg['token_refs']=[r['id'] for r in selected_tokens(cg['span'])]
+    def containing(span, preferred=None):
+        g = clause_groups.get(preferred)
+        if g and g['span'][0] <= span[0] and span[1] <= g['span'][1]: return g['id']
+        candidates = [g for g in clause_groups.values() if g['span'][0] <= span[0] and span[1] <= g['span'][1]]
+        return min(candidates, key=lambda g: g['span'][1]-g['span'][0])['id'] if candidates else root['id']
+    def dependence(relation, head, dependent, predicate, rule):
+        dependencies.append({'relation': relation, 'head': head, 'dependent': dependent,
+                             'predicate_ref': predicate, 'source_rule': rule})
+    def nominal(span, function, parent, predicate, kind='NP', reference=None, source_head=None):
+        g = group(kind, span, function, parent, predicate,
+                  'UNRESOLVED' if reference == 'UNRESOLVED' else 'GROUNDED_IN_PARSE')
+        rs = selected_tokens(span)
+        content = [r for j, r in enumerate(rs) if not (j == 0 and r['normalized'] in _DETERMINERS)]
+        # The existing Argument.head wins over linear position. A complement
+        # noun must never displace its governing head (quality OF responses).
+        prefix=[]
+        for r in content:
+            if prefix and r['normalized'] in {'de',"d'",'du','des'}:break
+            prefix.append(r)
+        matched=[r for r in prefix if r['normalized']==source_head] if source_head else []
+        pure_nouns=[r for r in prefix if 'NOUN' in r['nature_candidates'] and 'ADJECTIVE' not in r['nature_candidates']]
+        if kind in {'PRONOUN','DEMONSTRATIVE'}:head=rs[-1] if rs else None
+        elif len(matched)==1:head=matched[0]
+        elif len([r for r in prefix if 'corpus_definite_subject_nominal:'+r['normalized'] in frame.orthography_flags])==1:
+            head=next(r for r in prefix if 'corpus_definite_subject_nominal:'+r['normalized'] in frame.orthography_flags)
+        elif len(pure_nouns)==1:
+            proposed=pure_nouns[0]
+            at=prefix.index(proposed)
+            tail_nouns=[r for r in prefix[at+1:] if 'NOUN' in r['nature_candidates']
+                        and 'corpus_object_adjective:'+r['normalized'] not in frame.orthography_flags]
+            head=None if source_head and ' ' in source_head and tail_nouns else proposed
+        elif len(prefix)==1:head=prefix[0]
+        else:head=None
+        g['source_argument_head']=source_head
+        head_candidates=[]
+        for candidate in prefix:
+            nouns=[a for a in candidate['nature_analyses'] if nature_map.get(a['pos'])=='NOUN']
+            others=[r for r in prefix if r is not candidate and r['normalized'] not in _DETERMINERS]
+            if nouns and all('ADJECTIVE' in r['nature_candidates'] for r in others):
+                head_candidates.append({'token_ref':candidate['id'],'head':candidate['normalized'],
+                    'modifier_token_refs':[r['id'] for r in others],
+                    'status':'MORPHOLOGICAL_ALTERNATIVE','semantic_resolution':False})
+        determinant=next((r['normalized'] for r in rs[:2] if r['normalized'] in _DETERMINERS),None)
+        if len(rs)>1 and rs[0]['normalized'] in {'de',"d'"} and rs[1]['normalized'] in _DETERMINERS:
+            determinant=rs[1]['normalized']
+        qualified=_qualify_nominal_construction(prefix,determinant) if len(prefix)>1 and determinant else []
+        g['construction_candidates']=qualified
+        if len(qualified)==1:
+            selected=qualified[0]
+            candidate=next(r for r in prefix if r['id']==selected['token_ref'])
+            if head is None or head['id']==candidate['id']:
+                head=candidate
+                g['head_selection']=selected
+                if not any(c['token_ref']==head['id'] for c in head_candidates):
+                    head_candidates.append(dict(token_ref=head['id'],head=head['normalized'],
+                        modifier_token_refs=selected['modifier_token_refs'],status=selected['status'],semantic_resolution=False))
+        g['head_candidates']=head_candidates
+        if head is None and len(head_candidates)>1:
+            alternatives.append({'kind':'NOMINAL_HEAD_AMBIGUITY','group_ref':g['id'],
+                                 'head_candidates':head_candidates,'semantic_resolution':False})
+        if head is None:
+            g['head']='UNKNOWN' if len(head_candidates)>1 else (source_head or 'UNKNOWN')
+            g['status']='UNRESOLVED'
+            unresolved.append({'kind':'NOMINAL_HEAD_UNRESOLVED','group_ref':g['id']})
+        if head:
+            g['head'], g['head_token_ref'] = head['normalized'], head['id']
+            if kind in {'PRONOUN', 'DEMONSTRATIVE'} or head['selected_nature'] == 'PRONOUN':
+                head['selected_nature'] = 'PRONOUN'
+            elif 'NOUN' in head['nature_candidates']:
+                head['selected_nature'] = 'NOUN'
+            else:
+                head['selected_nature'] = 'UNKNOWN'; g['status'] = 'SYNTACTIC_SLOT_ONLY'
+                unresolved.append({'kind': 'UNKNOWN_NOMINAL', 'token_ref': head['id'], 'group_ref': g['id']})
+            for r in rs:
+                if r['normalized'] in _DETERMINERS and r is not head: r['selected_nature'] = 'DETERMINER'
+                if r is not head and r in prefix and 'ADJECTIVE' in r['nature_candidates'] and r['normalized'] not in _DETERMINERS:
+                    r['selected_nature'] = 'ADJECTIVE'
+                    ag = group('ADJP', r['span'], 'MODIFIER', g['id'], predicate, head=r['normalized'])
+                    ag['head_token_ref'] = r['id']
+                    dependence('MODIFIER', g['id'], ag['id'], predicate, 'existing_np_span_and_corpus_adjective')
+                    def features(rec, pos):
+                        return [a for a in rec['nature_analyses'] if nature_map.get(a['pos']) == pos]
+                    hs, ads = features(head, 'NOUN'), features(r, 'ADJECTIVE')
+                    agreements.append({'kind': 'NOUN_ADJECTIVE', 'head': head['id'], 'dependent': r['id'],
+                        'status': _assess_noun_adjective_agreement(hs, ads),
+                        'verified_fact': False, 'evidence': 'corpus_morphological_alternatives'})
+        if head and kind=='NP':
+            det=rs[0] if rs and rs[0] is not head and rs[0]['normalized'] in _DETERMINERS else None
+            if det and det['normalized'] in {'de',"d'"} and len(rs)>1 and rs[1] is not head and rs[1]['normalized'] in _DETERMINERS:det=rs[1]
+            if det:
+                hs=[a for a in head['nature_analyses'] if nature_map.get(a['pos'])=='NOUN' and a.get('number')]
+                agreements.append({'kind':'DETERMINER_NOUN','head':det['id'],'dependent':head['id'],
+                    'status':_assess_determiner_noun_agreement(det['normalized'], hs),
+                    'verified_fact':False,'evidence':'written_determiner_and_corpus_noun_alternatives'})
+        # Only expose nominal complements already contained in this Argument's
+        # span by the existing _np_from mechanism; no semantic PP role is guessed.
+        local=[t for t in toks if span[0]<=t.start and t.end<=span[1]]
+        for j,t in enumerate(local):
+            if j==0 or t.low not in {'de',"d'",'du','des'}:continue
+            child_at=j+1 if t.low in {'de',"d'"} else j
+            child,_=_np_from(local,child_at)
+            if child is None or child.span is None or child.kind!='NP' or child.span[0]<=span[0] or child.span[1]>span[1]:continue
+            pg=group('PP',(t.start,child.span[1]),'NOMINAL_COMPLEMENT',g['id'],predicate,
+                     'GROUNDED_IN_PARSE',head=t.low)
+            cg=nominal(child.span,'NOMINAL_COMPLEMENT_HEAD',pg['id'],predicate,child.kind,child.reference,child.head)
+            dependence('NOMINAL_COMPLEMENT',g['id'],cg['id'],predicate,'existing_np_nominal_complement_span')
+            break
+        return g
+    preposed_object_groups={}
+    preposed_object_details={}
+    for ci,(carrier_i,carrier_clause,arg,unit,auxiliary,participle,expected,observed,head_rows) in preposed_object_candidates.items():
+        antecedent=nominal(arg.span,'PREPOSED_DIRECT_OBJECT',clause_groups[carrier_i]['id'],unit.id,
+                           arg.kind,arg.reference,arg.head)
+        antecedent['source_rule']='existing_relative_object_gap'
+        antecedent['antecedent_for_relative_clause']=clause_groups[ci]['id']
+        preposed_object_groups[ci]=antecedent
+        lexical_token=token_by_span.get((participle.start,participle.end))
+        antecedent_token=antecedent.get('head_token_ref')
+        if not antecedent_token:
+            continue
+        preposed_object_details[ci]=(unit,auxiliary,participle,expected,observed,antecedent_token,
+                                     lexical_token.get('id') if lexical_token else None)
+        structural_clause_relations.append({'kind':'RELATIVE_OBJECT_ANTECEDENT',
+            'source':clause_groups[ci]['id'],'target':antecedent['id'],
+            'antecedent_span':list(arg.span),'predicate_refs':[unit.id],
+            'source_rule':'existing_relative_object_gap','status':'SOURCE_BOUND',
+            'semantic_resolution':False,'verified_fact':False})
+    def projected_subject(u):
+        # Native coordination already owns the subject's full extent. Never
+        # replace it with the nearest/last member or synthesize a group entity.
+        coords=[c for c in frame.coordinations if c.construction=='coordinated_subject'
+                and c.host==u.id and c.span and c.member_spans]
+        if len(coords)==1:
+            c=coords[0]
+            sg=group('NP',c.span,'SUBJECT',containing(c.span),u.id,head='COORDINATED')
+            sg.update(coordination_ref=c.id,coordination_kind=c.kind,member_refs=[],native_subject=u.subject,
+                      source_rule='existing_subject_coordination',head_token_ref=None)
+            for span,member in zip(c.member_spans,c.member_texts):
+                child=nominal(span,'SUBJECT_MEMBER',sg['id'],u.id,source_head=member)
+                sg['member_refs'].append(child['id'])
+                dependence('COORDINATED_MEMBER',sg['id'],child['id'],u.id,'existing_subject_coordination')
+            return sg
+        reference=u.subject_ref
+        # The native segmenter explicitly marks a main predicate resumed
+        # after a relative. Transport that carrier reference, never select
+        # an antecedent by proximity or rewrite the semantic unit.
+        source_clause=clauses[u.clause] if 0<=u.clause<len(clauses) else None
+        if reference is None and source_clause and source_clause.main_after_relative and source_clause.after_rel:
+            ids={unit.id for unit,draft in source_clause.after_rel.units}
+            refs=[unit.subject_ref for unit in frame.units if unit.id in ids and unit.subject_ref is not None
+                  and unit.subject_ref.span and unit.subject_ref.head==u.subject]
+            unique={ref.span:ref for ref in refs}
+            if len(unique)==1:reference=next(iter(unique.values()))
+        if reference is not None and reference.span:
+            span=list(reference.span)
+            sg=nominal(span,'SUBJECT',containing(span,u.clause),u.id,
+                       reference.kind,reference.reference,reference.head)
+            sg.update(native_subject=u.subject,subject_reference=reference.reference,
+                      source_rule='existing_subject_argument_span')
+            return sg
+        words=u.subject.split()
+        matches=[]
+        for j in range(len(toks)-len(words)+1):
+            seq=toks[j:j+len(words)]
+            if [t.low for t in seq]!=words:continue
+            in_clause=u.clause in clause_groups and clause_groups[u.clause]['span'][0]<=seq[0].start and seq[-1].end<=clause_groups[u.clause]['span'][1]
+            if not in_clause:continue
+            if seq[-1].end<=u.span[0] or (seq[0].hyphen_before and seq[0].low in _SUBJECT_PRONOUNS):
+                start=seq[0].start
+                if j and toks[j-1].low in _DETERMINERS:start=toks[j-1].start
+                matches.append([start,seq[-1].end])
+        # Recover the maximal EXISTING NP containing that native subject. This
+        # transports nominal complements/qualifiers, never changes u.subject.
+        # A unique parsed NP ending at the verbal chain is required.
+        candidates=[]
+        clause=clauses[u.clause] if 0<=u.clause<len(clauses) else None
+        local=clause.toks if clause else []
+        for j,t in enumerate(local):
+            if t.start>=u.span[0]:break
+            if t.low not in _DETERMINERS:continue
+            a,end=_np_from(local,j)
+            if not a or a.kind!='NP' or not a.span or a.span[1]>u.span[0]:continue
+            intervening=[w for w in local if a.span[1]<=w.start<u.span[0]]
+            if any(w.is_punct or (not w.analyses and w.low not in _ADVERBS_SKIPPABLE|_OBJECT_CLITICS|_REFLEXIVE_CLITICS|{'ne',"n'"}) for w in intervening):continue
+            compatible=any(a.span[0]<=m[0] and m[1]<=a.span[1] for m in matches)
+            content=[w.low for w in local if a.span[0]<=w.start and w.end<=a.span[1] and w.low not in _DETERMINERS]
+            if compatible or content==words:candidates.append(a)
+        if candidates:
+            width=max(a.span[1]-a.span[0] for a in candidates)
+            maximal=[a for a in candidates if a.span[1]-a.span[0]==width]
+            if len(maximal)==1:
+                a=maximal[0]
+                sg=nominal(a.span,'SUBJECT',containing(a.span,u.clause),u.id,a.kind,a.reference,a.head)
+                sg.update(native_subject=u.subject,source_rule='existing_subject_argument_span')
+                return sg
+        if len(matches)==1:
+            span=matches[0]
+            sg=nominal(span,'SUBJECT',containing(span,u.clause),u.id,
+                       'PRONOUN' if u.subject in _SUBJECT_PRONOUNS|_DEMONSTRATIVE_PRONOUNS else 'NP',source_head=u.subject)
+            sg['native_subject']=u.subject
+            return sg
+        unresolved.append({'kind':'SUBJECT_SPAN_UNRESOLVED','predicate_ref':u.id,'candidates':matches})
+        return None
+    predicate_groups, subjects = {}, {}
+    for u in frame.units:
+        extent = [u.span[0], max([u.span[1]]+[a.span[1] for a in u.objects if a.span])]
+        vg = group('VP', extent, 'VERBAL_PREDICATE', containing(extent, u.clause), u.id, head=u.lemma)
+        predicate_groups[u.id] = vg
+        draft_info = draft_by_unit.get(u.id)
+        finite_record = None
+        if draft_info is not None:
+            source_clause, draft = draft_info
+            if 0 <= draft.head_index < len(source_clause.toks):
+                finite_tok = source_clause.toks[draft.head_index]
+                finite_record = token_by_span.get((finite_tok.start, finite_tok.end))
+            if draft.head_index < draft.lex_index and 0 <= draft.lex_index < len(source_clause.toks):
+                lexical_tok = source_clause.toks[draft.lex_index]
+                aux_tok = source_clause.toks[draft.head_index]
+                aux_record = token_by_span.get((aux_tok.start, aux_tok.end))
+                lexical_record = token_by_span.get((lexical_tok.start, lexical_tok.end))
+                aux_rows = [a for a in (aux_record or {}).get('nature_analyses', []) if a.get('pos') == 'verb']
+                lexical_rows = [a for a in (lexical_record or {}).get('nature_analyses', []) if a.get('pos') == 'verb']
+                vg['verbal_chain'] = {
+                    'finite_auxiliary': {'surface': aux_tok.raw_form or aux_tok.low,
+                        'lemma': _lemma(aux_tok), 'span': [aux_tok.start, aux_tok.end],
+                        'analyses': aux_rows},
+                    'lexical_part': {'surface': lexical_tok.raw_form or lexical_tok.low,
+                        'lemma': _lemma(lexical_tok), 'span': [lexical_tok.start, lexical_tok.end],
+                        'form': 'PARTICIPLE' if 'PP' in _feats(lexical_tok) else draft.verb_form,
+                        'analyses': lexical_rows},
+                    'tense_aspect': 'COMPOUND_PAST' if 'PP' in _feats(lexical_tok) else draft.tense,
+                    'source_rule': 'existing_native_auxiliary_chain',
+                    'verified_fact': False,
+                }
+                if aux_record is not None and 'AUXILIARY' not in aux_record['functions']:
+                    aux_record['functions'].append('AUXILIARY')
+        verbs = [r for r in selected_tokens(u.span) if r['normalized'] == u.surface]
+        if verbs:
+            vg['head_token_ref'] = verbs[-1]['id']
+            verbs[-1]['selected_nature'] = 'VERB'
+            verbs[-1]['functions'].append('VERBAL_PREDICATE')
+        if u.subject is not None or u.subject_ref is not None:
+            sg=projected_subject(u)
+            if sg is not None:
+                subjects[u.id]=sg
+                dependence('SUBJECT',vg['id'],sg['id'],u.id,'existing_predicate_subject')
+                subject_head=next((r for r in records if r['id']==sg['head_token_ref']),None)
+                noun_numbers={a['number'] for a in (subject_head['nature_analyses'] if subject_head else []) if a['pos'] in {'noun','nom','NOM'} and a.get('number')}
+                expected_person = None
+                if sg.get('coordination_ref'):
+                    # Disjunction does not establish a plural agreement or
+                    # choose one member as the actual participant.
+                    wanted='pl' if sg.get('coordination_kind')=='AND' else None
+                else:
+                    wanted=('pl' if u.subject in {'nous','vous','ils','elles'} else
+                            ('sg' if u.subject in {'je',"j'",'tu','il','elle','on'} else
+                             (next(iter(noun_numbers)) if len(noun_numbers)==1 else None)))
+                    features = pronoun_features.get(u.subject or '')
+                    if features:
+                        expected_person, wanted = features
+                    elif wanted:
+                        expected_person = '3'
+                agreement_record = finite_record or (verbs[-1] if verbs else None)
+                vr=agreement_record['nature_analyses'] if agreement_record else []
+                if draft_info is not None and draft_info[1].head_index < draft_info[1].lex_index:
+                    aux_tok = draft_info[0].toks[draft_info[1].head_index]
+                    auxiliary_lemma = _lemma(aux_tok)
+                    equivalent_lemmas = {auxiliary_lemma}
+                    if auxiliary_lemma == 'être':
+                        equivalent_lemmas.add('estre')
+                    vr = [analysis for analysis in vr if analysis.get('lemma') in equivalent_lemmas]
+                observed_pairs={(a.get('person'), a.get('number')) for a in vr
+                                if a.get('pos')=='verb' and a.get('number')}
+                observed={number for person,number in observed_pairs if number}
+                if expected_person and wanted and observed_pairs:
+                    status = 'COMPATIBLE' if (expected_person, wanted) in observed_pairs else 'INCOMPATIBLE'
+                else:
+                    status = 'COMPATIBLE' if wanted in observed else ('INCOMPATIBLE' if wanted and observed else 'UNKNOWN')
+                agreements.append({'kind':'SUBJECT_VERB','head':sg['id'],'dependent':vg['id'],
+                    'status':status, 'expected_person':expected_person, 'expected_number':wanted,
+                    'observed_person_number':sorted([list(pair) for pair in observed_pairs]),
+                    'finite_form_surface': agreement_record['raw'] if agreement_record else None,
+                    'verified_fact':False,'evidence':'written_subject_or_determiner_and_corpus_alternatives'})
+                # In a supported être + past-participle chain, project the
+                # corpus-attested gender/number agreement separately from the
+                # finite auxiliary agreement above. Reflexive clitics are
+                # deliberately excluded: their COD/COI status is not resolved
+                # by this parser path, so subject agreement cannot be assumed.
+                if draft_info is not None:
+                    source_clause, draft = draft_info
+                    if (0 <= draft.head_index < draft.lex_index < len(source_clause.toks)
+                            and 'PP' in _feats(source_clause.toks[draft.lex_index])):
+                        aux_tok = source_clause.toks[draft.head_index]
+                        lexical_tok = source_clause.toks[draft.lex_index]
+                        if _pred(aux_tok) == 'BE':
+                            subject_end = sg.get('span', [None, None])[1]
+                            reflexive_clitics = {'me', "m'", 'te', "t'", 'se', "s'", 'nous', 'vous'}
+                            aux_start = aux_tok.start
+                            has_reflexive_clitic = subject_end is None or any(
+                                token.low in reflexive_clitics
+                                and subject_end <= token.start < aux_start
+                                for token in source_clause.toks
+                            )
+                            subject_pairs = {
+                                (analysis.get('gender'), analysis.get('number'))
+                                for analysis in (subject_head or {}).get('nature_analyses', [])
+                                if analysis.get('pos') in {'noun', 'nom', 'NOM'}
+                                and analysis.get('gender') in {'fem', 'masc'}
+                                and analysis.get('number') in {'sg', 'pl'}
+                            }
+                            lexical_record = token_by_span.get((lexical_tok.start, lexical_tok.end))
+                            participle_pairs = {
+                                (analysis.get('gender'), analysis.get('number'))
+                                for analysis in (lexical_record or {}).get('nature_analyses', [])
+                                if analysis.get('pos') == 'verb'
+                                and analysis.get('mood') == 'participle'
+                                and analysis.get('tense') == 'past'
+                                and analysis.get('gender') in {'fem', 'masc'}
+                                and analysis.get('number') in {'sg', 'pl'}
+                            }
+                            if not has_reflexive_clitic and subject_pairs and participle_pairs:
+                                matched = subject_pairs & participle_pairs
+                                candidate_pairs = {(subject_pair, participle_pair)
+                                                   for subject_pair in subject_pairs
+                                                   for participle_pair in participle_pairs}
+                                matching_pairs = {(subject_pair, participle_pair)
+                                                  for subject_pair, participle_pair in candidate_pairs
+                                                  if subject_pair == participle_pair}
+                                agreement_status = ('COMPATIBLE' if matching_pairs == candidate_pairs else
+                                                    ('INCOMPATIBLE' if not matching_pairs else 'UNKNOWN'))
+                                agreements.append({
+                                    'kind': 'SUBJECT_PARTICIPLE', 'head': sg['id'], 'dependent': vg['id'],
+                                    'status': agreement_status,
+                                    'expected_gender': next(iter({pair[0] for pair in subject_pairs}))
+                                                       if len({pair[0] for pair in subject_pairs}) == 1 else None,
+                                    'expected_number': next(iter({pair[1] for pair in subject_pairs}))
+                                                       if len({pair[1] for pair in subject_pairs}) == 1 else None,
+                                    'expected_gender_number': sorted([list(pair) for pair in subject_pairs]),
+                                    'observed_gender_number': sorted([list(pair) for pair in participle_pairs]),
+                                    'matching_gender_number': sorted([list(pair) for pair in matched]),
+                                    'auxiliary_surface': aux_tok.raw_form or aux_tok.low,
+                                    'participle_surface': lexical_tok.raw_form or lexical_tok.low,
+                                    'evidence_refs': {'subject_token': subject_head.get('id') if subject_head else None,
+                                                      'participle_token': lexical_record.get('id') if lexical_record else None},
+                                    'evidence': 'existing_etre_participle_corpus_agreement',
+                                    'source_rule': 'existing_etre_participle_corpus_agreement',
+                                    'verified_fact': False,
+                                })
+        elif u.verb_form=='IMPERATIVE':
+            unresolved.append({'kind':'IMPLICIT_SUBJECT','predicate_ref':u.id,'written_subject_invented':False})
+        for a in u.objects:
+            if a.span:
+                parent = vg['id'] if vg['span'][0] <= a.span[0] and a.span[1] <= vg['span'][1] else containing(a.span,u.clause)
+                ng=nominal(a.span,'DIRECT_OBJECT',parent,u.id,a.kind,a.reference,a.head)
+                dependence('DIRECT_OBJECT',vg['id'],ng['id'],u.id,'existing_predicate_object')
+    for ci,(unit,auxiliary,participle,expected,observed,antecedent_token,participle_token) in preposed_object_details.items():
+        antecedent=preposed_object_groups[ci]
+        vp=predicate_groups.get(unit.id)
+        if vp is None:
+            continue
+        dependence('PREPOSED_DIRECT_OBJECT',vp['id'],antecedent['id'],unit.id,'existing_relative_object_gap')
+        candidate_pairs={(want,seen) for want in expected for seen in observed}
+        matching={(want,seen) for want,seen in candidate_pairs if want==seen}
+        status=('COMPATIBLE' if candidate_pairs and matching==candidate_pairs else
+                ('INCOMPATIBLE' if candidate_pairs and not matching else 'UNKNOWN'))
+        agreements.append({'kind':'ANTECEDENT_PARTICIPLE','head':antecedent['id'],'dependent':vp['id'],
+            'status':status,
+            'expected_gender':next(iter({pair[0] for pair in expected})) if len({pair[0] for pair in expected})==1 else None,
+            'expected_number':next(iter({pair[1] for pair in expected})) if len({pair[1] for pair in expected})==1 else None,
+            'expected_gender_number':sorted([list(pair) for pair in expected]),
+            'observed_gender_number':sorted([list(pair) for pair in observed]),
+            'matching_gender_number':sorted([list(want) for want,seen in matching]),
+            'auxiliary_surface':auxiliary.raw_form or auxiliary.low,
+            'participle_surface':participle.raw_form or participle.low,
+            'evidence_refs':{'antecedent_token':antecedent_token,'participle_token':participle_token,
+                             'auxiliary_span':[auxiliary.start,auxiliary.end]},
+            'evidence':'existing_avoir_preposed_object_participle_agreement',
+            'source_rule':'existing_avoir_preposed_object_participle_agreement',
+            'verified_fact':False})
+    for o in frame.oblique_arguments:
+        if o.span:
+            pg=group('PP',o.span,'OBLIQUE',containing(o.span),o.unit,
+                     'UNRESOLVED' if o.role=='UNRESOLVED' else 'GROUNDED_IN_PARSE',head=o.marker)
+            pg['semantic_role']=o.role
+            if o.argument.span:
+                ng=nominal(o.argument.span,'OBLIQUE_COMPLEMENT',pg['id'],o.unit,o.argument.kind,o.argument.reference,o.argument.head)
+                dependence('OBLIQUE_COMPLEMENT',pg['id'],ng['id'],o.unit,'existing_oblique_argument')
+            if o.unit in predicate_groups:dependence('OBLIQUE',predicate_groups[o.unit]['id'],pg['id'],o.unit,'existing_oblique_argument')
+    for m in frame.manner_modifiers:
+        if m.span:
+            mg=group('ADVP',m.span,'MODIFIER',containing(m.span),m.unit,head=m.cue)
+            for r in selected_tokens(m.span):r['selected_nature']='ADVERB';mg['head_token_ref']=r['id']
+            if m.unit in predicate_groups:dependence('MODIFIER',predicate_groups[m.unit]['id'],mg['id'],m.unit,'existing_manner_modifier')
+    # Expose written NPs even where a governing sense is open. Reuse _np_from,
+    # never turn them into subjects/objects without an existing attachment.
+    occupied=[g['span'] for g in groups if g['kind'] in {'NP','PRONOUN','DEMONSTRATIVE'}]
+    for c in clauses:
+        for i,t in enumerate(c.toks):
+            rec=token_by_span.get((t.start,t.end))
+            if t.low not in _DETERMINERS or (rec and rec['selected_nature']=='PRONOUN'):continue
+            if any(s[0]<=t.start<s[1] for s in occupied):continue
+            a,_=_np_from(c.toks,i)
+            if a is not None and a.kind=='NP' and a.span:
+                nominal(a.span,'UNASSIGNED',containing(a.span),None,a.kind,a.reference,a.head);occupied.append(list(a.span))
+    # Constituent-level written negation is described independently of verbal
+    # polarity. It does not deny an event or turn an exclusion into a preference.
+    for i,t in enumerate(toks[:-1]):
+        if t.low not in _ORAL_NEGATORS or toks[i+1].low not in (_PREPOSITIONS|_DETERMINERS):continue
+        rec=token_by_span[(t.start,t.end)]
+        possible=[g for g in groups if g['kind']=='NP' and g['span'][0]>=t.end
+                  and not frame.raw[t.end:g['span'][0]].strip()]
+        if not possible:continue
+        ng=min(possible,key=lambda g:g['span'][0])
+        rec['selected_nature']='ADVERB'
+        cg=group('CONSTITUENT',(t.start,ng['span'][1]),'CONSTITUENT_NEGATION',containing((t.start,ng['span'][1])),head=t.low)
+        old=group_ids.get(ng['parent'])
+        if old and ng['id'] in old['children']:old['children'].remove(ng['id'])
+        ng['parent']=cg['id'];cg['children'].append(ng['id'])
+        ng['polarity']='negative';cg['polarity']='negative'
+        dependence('CONSTITUENT_NEGATION',ng['id'],rec['id'],None,'written_negator_before_np')
+    # Descriptive P1 fragments reuse the existing COMPLETE PP/NP readers.
+    # No predicate, semantic role or unwritten preposition is manufactured.
+    chunks=[];chunk=[]
+    for token in toks:
+        if token.is_punct:
+            if chunk:chunks.append(chunk);chunk=[]
+        else:chunk.append(token)
+    if chunk:chunks.append(chunk)
+    fragment_records=[]
+    def fragment_host(span):
+        hosts=set()
+        for ci,c in enumerate(clauses):
+            if not c.toks or not c.toks[0].start<=span[0]<=span[1]<=c.toks[-1].end:continue
+            for u in frame.units:
+                if u.clause!=ci or u.span[1]>span[0]:continue
+                if any(mark in frame.raw[u.span[1]:span[1]] for mark in ':;«»“”"'):continue
+                hosts.add(u.id)
+        return next(iter(hosts)) if len(hosts)==1 else None
+    for position,local in enumerate(chunks):
+        negative=local[0].low=='pas'
+        start=1 if negative else 0
+        if start>=len(local):continue
+        parsed=None;at=None;partitive_alternative=False
+        for k in range(start,len(local)):
+            if (local[k].low not in _PREPOSITIONS|_OBJECT_BOUNDARY_PREPOSITIONS|{'de',"d'"}
+                    or _is_verb(local,k)):continue
+            value=_oblique_members(local,k,len(local)-1)
+            # de + nominal has both prepositional and partitive readings.
+            # Keep the existing complete NP as an alternative, never erase it.
+            if value is None and local[k].low in {'de',"d'"} and k+1<len(local):
+                arg,nj=_np_from(local,k+1)
+                if arg is not None and arg.kind=='NP' and nj==len(local):
+                    value=(local[k].low,'UNRESOLVED',[arg],[]);partitive_alternative=True
+            if value is not None:parsed=value;at=k;break
+        record=None
+        if parsed is not None:
+            marker,role,args,links=parsed
+            span=[local[at].start,local[-1].end];host=fragment_host(span)
+            pg=next((g for g in groups if g['kind']=='PP' and g['span']==span),None)
+            if pg is None:
+                pg=group('PP',span,'OBLIQUE' if host else 'ELLIPTICAL_OBLIQUE',containing(span),host,
+                         status='SYNTACTIC_CONSTRUCTION',head=marker)
+                pg['source_rule']='existing_nominal_fragment_construction'
+                pg['semantic_role']='UNRESOLVED'
+            children=[]
+            for arg in args:
+                if arg.span is None:continue
+                ng=next((g for g in groups if g['kind']=='NP' and g['span']==list(arg.span)),None)
+                if ng is None:ng=nominal(arg.span,'OBLIQUE_COMPLEMENT',pg['id'],host,arg.kind,arg.reference,arg.head)
+                children.append(ng['id'])
+                if not any(d['relation']=='OBLIQUE_COMPLEMENT' and d['head']==pg['id'] and d['dependent']==ng['id'] for d in dependencies):
+                    dependence('OBLIQUE_COMPLEMENT',pg['id'],ng['id'],host,'existing_nominal_fragment_construction')
+            pg['fragment_member_refs']=children;pg['fragment_connectives']=list(links)
+            if partitive_alternative:
+                pg['status']='SYNTACTIC_CANDIDATE'
+                whole,nj=_np_from(local,at)
+                if whole is not None and whole.kind=='NP' and nj==len(local):
+                    nominal_reading=next((g for g in groups if g['kind']=='NP' and g['span']==list(whole.span)),None)
+                    if nominal_reading is None:
+                        nominal_reading=nominal(whole.span,'UNASSIGNED',containing(whole.span),None,whole.kind,whole.reference,whole.head)
+                    alternatives.append(dict(kind='PARTITIVE_NOMINAL_OR_PREPOSITIONAL_FRAGMENT',span=span,
+                        reading_group_refs=[nominal_reading['id'],pg['id']],selected_reading=None,
+                        source_rule='existing_nominal_fragment_construction',semantic_resolution=False))
+            record=dict(group_ref=pg['id'],member_refs=children,kind='PP',marker=marker,
+                        predicate_ref=host,span=span,complete_segment=at==start)
+        elif not any(u.span[0]>=local[0].start and u.span[1]<=local[-1].end for u in frame.units):
+            # Bare NP is represented only when the existing reader consumes the
+            # complete segment. An unknown lexical head remains unknown.
+            arg,end=_np_from(local,start)
+            if arg is not None and arg.kind=='NP' and arg.span is not None and end==len(local):
+                span=list(arg.span)
+                ng=next((g for g in groups if g['kind']=='NP' and g['span']==span),None)
+                if ng is None:ng=nominal(span,'ELLIPTICAL_NOMINAL',containing(span),None,arg.kind,arg.reference,arg.head)
+                record=dict(group_ref=ng['id'],member_refs=[ng['id']],kind='NP',marker=None,
+                            predicate_ref=None,span=span,complete_segment=True)
+        if record is None:continue
+        record.update(position=position,constituent_polarity='negative' if negative else 'positive',
+                      omitted_predicate=record['predicate_ref'] is None,semantic_resolution=False,verified_fact=False)
+        g=group_ids[record['group_ref']]
+        g['constituent_polarity']=record['constituent_polarity']
+        if negative and record['complete_segment']:
+            nr=token_by_span.get((local[0].start,local[0].end))
+            record['negator_ref']=nr['id'] if nr else None
+            if nr and not any(d['relation']=='CONSTITUENT_NEGATION' and d['head']==g['id'] and d['dependent']==nr['id'] for d in dependencies):
+                dependence('CONSTITUENT_NEGATION',g['id'],nr['id'],None,'existing_nominal_fragment_construction')
+            for ref in record['member_refs']:group_ids[ref]['constituent_polarity']='negative'
+        nominal_fragments.append(record)
+        if negative and record.get('negator_ref') and fragment_records:
+            previous=fragment_records[-1]
+            if previous['position']+1==position and previous['constituent_polarity']=='positive':
+                between=[r for r in records if previous['span'][1]<=r['span'][0] and r['span'][1]<=local[0].start]
+                same_host=previous['predicate_ref']==record['predicate_ref']
+                constituent_contrasts.append(dict(id='contrast:'+str(len(constituent_contrasts)+1),
+                    kind='EXPLICIT_CONSTITUENT_CONTRAST',proposed_group_ref=previous['group_ref'],
+                    rejected_group_ref=record['group_ref'],negator_ref=record['negator_ref'],
+                    separator_refs=[r['id'] for r in between],
+                    host_predicate_ref=record['predicate_ref'] if same_host else None,
+                    host_alignment='SAME_NATIVE_HOST' if same_host else 'UNRESOLVED',
+                    same_construction=previous['kind']==record['kind'] and previous['marker']==record['marker'],
+                    span=[previous['span'][0],record['span'][1]],
+                    source_rule='existing_nominal_fragment_construction',
+                    semantic_resolution=False,verified_fact=False))
+        fragment_records.append(record)
+
+    # A copular construction is syntax, not a PredicateUnit/event. Its
+    # attribute is never a DIRECT_OBJECT or an accepted semantic assertion.
+    # Corpus alternatives and legacy semantic units are retained intact.
+    for ci,c in enumerate(clauses):
+        local=c.toks
+        for k,t in enumerate(local):
+            if not t.analyses or not any(lemma=='être' for lemma,features in t.analyses):continue
+            fs=_feats(t)
+            if 'PP' in fs:continue
+            start=k
+            if 'INF' in fs:
+                q=k-1
+                while q>=0 and local[q].low in _ADVERBS_SKIPPABLE|_FR_NEGATORS:q-=1
+                if q<0 or not local[q].analyses or _MODALITY.get(_pred(local[q])) is None:continue
+                start=q
+            elif not fs.intersection({'PRES','SUBJ','IMPF','FUT','COND','PAST_SIMPLE'}):continue
+            j=k+1
+            degrees=[]
+            while j<len(local) and local[j].low in _ADVERBS_SKIPPABLE|_FR_NEGATORS:
+                degrees.append(local[j]);j+=1
+            if j>=len(local) or local[j].is_punct:continue
+            attr=local[j]
+            rs=readings(attr)
+            adjs=[a for a in rs if nature_map.get(a.pos)=='ADJECTIVE']
+            # A participle after BE may be a passive/compound tense. Preserve
+            # that ambiguity rather than declaring it an attribute here.
+            if not adjs or 'PP' in _feats(attr):continue
+            following=local[j+1:]
+            if following and not following[0].is_punct and following[0].low not in _PREPOSITIONS|set(_CONNECTIVES):continue
+            cg=group('COPULAR_CONSTRUCTION',(local[start].start,attr.end),'COPULAR_CONSTRUCTION',
+                     containing((local[start].start,attr.end),ci),head='être',status='SYNTACTIC_CONSTRUCTION')
+            cg.update(source_rule='existing_corpus_copular_construction',semantic_resolution=False,
+                      semantic_predicate_created=False,attribute_is_object=False)
+            vg=group('VP',(local[start].start,t.end),'VERBAL_COPULA',cg['id'],head='être',status='SYNTACTIC_CONSTRUCTION')
+            vg['source_rule']='existing_corpus_copular_construction'
+            ag=group('ADJP',(degrees[0].start if degrees else attr.start,attr.end),'SUBJECT_ATTRIBUTE',cg['id'],head=attr.low,status='SYNTACTIC_CONSTRUCTION')
+            ag.update(source_rule='existing_corpus_copular_construction',head_token_ref=token_by_span[(attr.start,attr.end)]['id'])
+            dependence('SUBJECT_ATTRIBUTE',vg['id'],ag['id'],None,'existing_corpus_copular_construction')
+            ar=token_by_span[(attr.start,attr.end)]
+            competing=[u.id for u in frame.units if u.span[0]<=attr.start and attr.end<=u.span[1]]
+            ar['selected_nature']='UNKNOWN' if competing else 'ADJECTIVE'
+            if competing:
+                alternatives.append({'kind':'COPULAR_ATTRIBUTE_OR_LEGACY_PREDICATE','token_ref':ar['id'],
+                                     'predicate_refs':competing,'construction_ref':cg['id'],'semantic_resolution':False})
+            subject,person=_subject_before(local,start)
+            if subject is not None:
+                # The existing subject routine gives a written cue only;
+                # expose its exact source without introducing a semantic unit.
+                words=subject.split()
+                spans=[]
+                for q in range(start-len(words)+1):
+                    seq=local[q:q+len(words)]
+                    if [w.low for w in seq]==words:spans.append((seq[0].start,seq[-1].end))
+                existing_subject = next((g for g in groups if g['function']=='SUBJECT'
+                                         and len(spans)==1 and g['span']==list(spans[0])), None)
+                sg = existing_subject
+                if len(spans)==1 and sg is None:
+                    sg=nominal(spans[0],'SUBJECT',containing(spans[0],ci),None,
+                               'PRONOUN' if subject in _SUBJECT_PRONOUNS|_DEMONSTRATIVE_PRONOUNS else 'NP',source_head=subject)
+                    sg['construction_ref']=cg['id']
+                    dependence('SUBJECT',vg['id'],sg['id'],None,'existing_corpus_copular_construction')
+                if sg is not None:
+                    copula_record = token_by_span.get((t.start, t.end))
+                    copula_lemma = _lemma(t)
+                    copula_lemmas = {copula_lemma} | ({'estre'} if copula_lemma == 'être' else set())
+                    copula_rows = [a for a in (copula_record or {}).get('nature_analyses', [])
+                                   if a.get('pos') == 'verb' and a.get('lemma') in copula_lemmas
+                                   and a.get('mood') in {'indicative', 'conditional', 'subjunctive'}]
+                    expected = pronoun_features.get(subject)
+                    if expected is None:
+                        subject_record = token_by_span.get(tuple(sg.get('span', [])))
+                        numbers = {a.get('number') for a in (subject_record or {}).get('nature_analyses', [])
+                                   if a.get('pos') in {'noun', 'nom', 'NOM'} and a.get('number')}
+                        expected = ('3', next(iter(numbers))) if len(numbers) == 1 else None
+                    observed = {(a.get('person'), a.get('number')) for a in copula_rows
+                                if a.get('person') and a.get('number')}
+                    if expected and observed:
+                        status = 'COMPATIBLE' if expected in observed else 'INCOMPATIBLE'
+                    else:
+                        status = 'UNKNOWN'
+                    agreements.append({'kind': 'SUBJECT_VERB', 'head': sg['id'], 'dependent': vg['id'],
+                        'status': status, 'expected_person': expected[0] if expected else None,
+                        'expected_number': expected[1] if expected else None,
+                        'observed_person_number': sorted([list(pair) for pair in observed]),
+                        'finite_form_surface': t.raw_form or t.low,
+                        'verified_fact': False, 'evidence': 'existing_corpus_copular_construction'})
+    # Construction alternatives describe the same source without replacing
+    # its native units, final oblique arguments, closure or authority.
+    for k in range(len(toks)):
+        licensed=next(((head,name) for head,name,role in _LICENSED_OBLIQUES
+                       if role=='SOURCE' and tuple(t.low for t in toks[k:k+len(head)])==head),None)
+        if licensed is None:continue
+        head,name=licensed
+        marker_tokens=toks[k:k+len(head)]
+        native=[u for u in frame.units if u.verb_form=='INFINITIVE'
+                and any(u.span==(t.start,t.end) for t in marker_tokens)]
+        if len(native)!=1:continue
+        end=k+len(head)
+        while end<len(toks) and not toks[end].is_punct:end+=1
+        end-=1
+        if end<k+len(head):continue
+        parsed=_oblique_members(toks,k,end)
+        if parsed is None or parsed[0]!=name:continue
+        span=[toks[k].start,toks[end].end]
+        alternatives.append({'kind':'SOURCE_LOCUTION_OR_INFINITIVE','span':span,
+            'source_text':frame.raw[slice(*span)],'selected':None,
+            'predicate_refs':[native[0].id],
+            'token_refs':[r['id'] for r in selected_tokens(span)],
+            'interpretations':[
+                {'kind':'LICENSED_PREPOSITIONAL_LOCUTION_CANDIDATE','marker':name,
+                 'argument_spans':[list(a.span) for a in parsed[2] if a.span],
+                 'functional_role_selected':False,'semantic_resolution':False},
+                {'kind':'NATIVE_INFINITIVE_READING','predicate_ref':native[0].id,
+                 'predicate_span':list(native[0].span),'semantic_resolution':False}],
+            'source_rule':'existing_source_locution_or_infinitive',
+            'evidence_refs':{'marker_rule':'_LICENSED_OBLIQUES','suffix_parser':'_oblique_members',
+                             'native_predicate_ref':native[0].id},
+            'semantic_resolution':False,'verified_fact':False})
+    for ci,c in enumerate(clauses):
+        for initial,draft in c.units:
+            unit=by_unit.get(initial.id)
+            if unit is None or unit.verb_form!='PARTICIPLE':continue
+            if not 0<=draft.head_index<draft.lex_index<len(c.toks):continue
+            lexical=c.toks[draft.lex_index]
+            if 'PP' not in _feats(lexical):continue
+            be=[t for t in c.toks[draft.head_index:draft.lex_index] if t.analyses and _pred(t)=='BE']
+            if len(be)!=1:continue
+            adjective=[dict(a.to_dict(),verified_fact=False) for a in readings(lexical)
+                       if nature_map.get(a.pos)=='ADJECTIVE']
+            if not adjective:continue
+            attribute=token_by_span.get((lexical.start,lexical.end))
+            copula=token_by_span.get((be[0].start,be[0].end))
+            if attribute is None or copula is None:continue
+            span=[be[0].start,lexical.end]
+            alternatives.append({'kind':'PARTICIPIAL_PREDICATION_OR_ATTRIBUTE','span':span,
+                'source_text':frame.raw[slice(*span)],'selected':None,
+                'predicate_refs':[unit.id],'token_refs':[r['id'] for r in selected_tokens(span)],
+                'interpretations':[
+                    {'kind':'NATIVE_PARTICIPIAL_PREDICATION','predicate_ref':unit.id,
+                     'predicate_span':list(unit.span),'semantic_resolution':False},
+                    {'kind':'COPULAR_ATTRIBUTE_CANDIDATE','copula_token_ref':copula['id'],
+                     'attribute_token_ref':attribute['id'],'semantic_resolution':False}],
+                'adjective_evidence':adjective,'source_rule':'existing_participle_attribute_alternative',
+                'evidence_refs':{'native_clause':ci,'native_predicate_ref':unit.id,
+                                 'native_chain_indices':[draft.head_index,draft.lex_index],
+                                 'corpus':identity},
+                'semantic_resolution':False,'verified_fact':False})
+    for r in records:
+        if len(r['nature_candidates'])>1:
+            alternatives.append({'token_ref':r['id'],'candidates':r['nature_candidates'],
+                                 'syntactic_selection':r['selected_nature'],'semantic_resolution':False})
+    for item in frame.missing:unresolved.append({'kind':'UNANALYZED_CONTENT','source_marker':item})
+    # Unknown finite predication must remain visibly incomplete even if the
+    # legacy parser reports no unit for it; no lexical predicate is synthesized.
+    if not frame.units and any(r['lexical_status']=='UNATTESTED' for r in records):
+        unresolved.append({'kind':'UNANALYZED_CONTENT','source_marker':'no_existing_predicate'})
+    # Definitions describe implemented operations, not an educational corpus
+    # or additional authority. Emit only rules actually referenced this time.
+    rule_specs={
+        **_NOMINAL_AGREEMENT_RULE_SPECS,
+        'existing_nominal_fragment_construction':('native source tokens and complete _oblique_members/_np_from segments','PP/NP and explicit constituent contrast','no predicate invented, no semantic recipient assigned, no implicit preposition inserted','_oblique_members/_np_from'),
+        'BARE_CAPITALIZED_NOMINAL_BEFORE_FINITE':('source case, pinned noun and agreeing finite alternatives','local syntactic selection or open nominal/verbal constructions','no punctuation crossing, no identity or truth; competing nominal successor remains open','_bare_nominal_subject_evidence'),
+        'existing_predicate_span':('PredicateUnit.span and object spans','VP group','existing predicate only','PredicateUnit'),
+        'existing_argument_span':('Argument span/head/reference','NP or pronoun group','original argument head, no noun by linear last position','_np_from/_objects_for'),
+        'existing_parser_span_projection':('existing token/clause/modifier spans','source-aligned group','no invented source span','_tokenize/_segment'),
+        'existing_native_relative_structure':('native relative subject_ref and main_after_relative.after_rel','descriptive clause hierarchy and nominal attachment','unique native reference/carrier; semantic relations untouched','_Clause/PredicateUnit.subject_ref'),
+        'existing_relative_object_gap':('source-bound relative que/qu\' with a complete immediately preceding NP and native HAVE + past-participle chain','descriptive preposed direct-object dependency and participle agreement','unique contiguous carrier, corpus-backed nominal/participle features, no semantic unit mutation or antecedent selection beyond the relative gap','_segment/_np_from/_structural_language_projection'),
+        'existing_subject_coordination':('CoordinationRef host/span/member_spans','one subject NP and member NPs','native coordinated_subject only; no new group entity','CoordinationRef'),
+        'existing_subject_argument_span':('native subject cue and existing NP or subject_ref span','full subject NP with separate head','unique maximal source NP; legacy subject unchanged','_np_from/PredicateUnit.subject_ref'),
+        'existing_source_locution_or_infinitive':('licensed SOURCE marker, complete parsed suffix and native infinitive','two unselected construction readings','no final SOURCE role selected; native units/closure untouched','_LICENSED_OBLIQUES/_oblique_members/PredicateUnit'),
+        'existing_participle_attribute_alternative':('native participial chain with unique BE and attested adjective','two unselected construction readings','HAVE-only is not BE; no semantic unit or closure replaced','_Clause/_Draft/lookup_surface_form'),
+        'existing_etre_participle_corpus_agreement':('written subject gender/number and corpus-attested past-participle readings in a non-reflexive BE chain','descriptive SUBJECT_PARTICIPLE agreement status','no correction, passive/attribute selection, semantic truth, or authority; reflexive chains without COD/COI analysis remain unassessed','_build_drafts/_structural_language_projection/lookup_surface_form'),
+        'existing_avoir_preposed_object_participle_agreement':('corpus-backed relative object antecedent and HAVE + past participle chain','descriptive ANTECEDENT_PARTICIPLE agreement status','source-bound relative gap only; no semantic argument mutation, correction application, truth claim, or authority','_segment/_np_from/_structural_language_projection/lookup_surface_form'),
+        'existing_corpus_copular_construction':('native BE/modal chain and corpus adjective alternatives','descriptive copular construction/attribute','not a semantic predicate; participial ambiguity excluded; no closure','_subject_before/_feats/lookup_surface_form'),
+        'written_copula_and_finite_corpus_alternatives':('written copula subject and finite corpus person/number analyses','descriptive SUBJECT_VERB agreement status','INCOMPATIBLE only when the finite cell contradicts the written subject; no semantic proposition or truth value','_structural_language_projection/lookup_surface_form'),
+        'existing_predicate_subject':('PredicateUnit.subject and matching source span','SUBJECT dependency','unique written match or subject_ref; no implicit subject token','_subject_before'),
+        'existing_predicate_object':('PredicateUnit.objects','DIRECT_OBJECT dependency','existing object span, reference unchanged','_objects_for'),
+        'existing_np_span_and_corpus_adjective':('existing NP prefix and corpus adjective analyses','ADJP modifier dependency','outside nested nominal complement; no semantic claim','_np_from/_disambiguate_nominal_context'),
+        'existing_np_nominal_complement_span':('Argument.span/head and _np_from child','nominal PP/NP hierarchy','child already contained in original argument span','_np_from'),
+        'existing_oblique_argument':('ObliqueArgumentRef','PP and dependency','SOURCE/INSTRUMENT/UNRESOLVED preserved','ObliqueArgumentRef'),
+        'existing_manner_modifier':('MannerRef','ADVP modifier dependency','existing typed modifier only','MannerRef'),
+        'written_negator_before_np':('written oral negator immediately before NP','CONSTITUENT_NEGATION dependency','written constituent only; no event negation or preference invention','_np_from/_structural_language_projection'),
+        'existing_predicate_embedded_under':('PredicateUnit.embedded_under','nested CLAUSE groups','existing link, no proximity binding or cycle','PredicateUnit.embedded_under'),
+        'written_subject_or_determiner_and_corpus_alternatives':('written pronoun or noun number and verb analyses','SUBJECT_VERB assessment','unknown nominal head cannot be certified from determiner alone','lookup_surface_form'),
+        'written_subject_and_finite_corpus_alternatives':('written subject person/number and finite corpus person/number alternatives','finite SUBJECT_VERB agreement assessment','compound chains compare the finite auxiliary, not the agreeing participle; no truth value is produced','_structural_language_projection/lookup_surface_form'),
+    }
+    used={g['source_rule'] for g in groups}|{d['source_rule'] for d in dependencies}|{a['evidence'] for a in agreements}
+    used|={g['attachment_rule'] for g in groups if 'attachment_rule' in g}
+    used|={a['source_rule'] for a in alternatives if 'source_rule' in a}
+    used|={c['source_rule'] for c in constituent_contrasts}
+    used|={t['nominal_subject_evidence']['rule'] for t in records if t.get('nominal_subject_evidence')}
+    definitions=[]
+    for rid in sorted(used):
+        inp,out,conditions,implementation=rule_specs[rid]
+        definitions.append({'id':rid,'input':inp,'output':out,'conditions':conditions,
+                            'implementation':'app/semantic/lattice/french_grammar.py::'+implementation,
+                            'authority_created':False,'semantic_truth_created':False})
+    # P5 transports the existing draft scope calculation; it never changes a unit.
+    # _negates_operator is NOT a negation detector: positive chains stay NONE.
+    meaning_operator_bindings=[]
+    final_by_id={unit.id:unit for unit in frame.units}
+    seen_operator_units=set()
+    for clause in clauses:
+        for native,draft in clause.units:
+            unit=final_by_id.get(native.id)
+            if unit is None or draft.modal_tok is None or unit.id in seen_operator_units:continue
+            seen_operator_units.add(unit.id)
+            uncertain=(not unit.negation_confirmed or unit.ne_expletive or unit.restriction is not None
+                       or any(a.startswith('negated_scope_open:') and a.endswith(unit.id) for a in frame.ambiguities))
+            negative=unit.polarity=='negative'
+            target=('UNKNOWN' if uncertain else ('MODAL_OPERATOR' if _negates_operator(clause.toks,draft) else 'CONTENT')) if negative else 'NONE'
+            modal=draft.modal_tok
+            meaning_operator_bindings.append(dict(unit_ref=unit.id,operator_kind=unit.modality,
+                operator_span=[modal.start,modal.end],content_span=list(unit.span),
+                operator_is_local=any(t is modal for t in clause.toks),negation_scope=target,
+                native_negation_confirmed=unit.negation_confirmed,native_ne_expletive=unit.ne_expletive,
+                source_rule='existing_modal_draft_scope',implementation='_negates_operator',
+                semantic_resolution=False,verified_fact=False))
+    meaning_property_bindings,meaning_relation_bindings=_meaning_construction_bindings(frame,toks,clauses,identity)
+    return {'schema':'BRODY_STRUCTURAL_LANGUAGE_V0','original':frame.raw,
+            'tokens':records,'groups':groups,'dependencies':dependencies,'agreements':agreements,'rule_definitions':definitions,
+            'clause_relations':[dict(kind=r.kind,source=r.source,target=r.target,evidence=r.evidence) for r in frame.relations],
+            'structural_clause_relations':structural_clause_relations,
+            'scopes':[dict(unit=u.id,clause=u.clause,embedded_under=u.embedded_under,polarity=u.polarity,
+                           modality=u.modality,negator=u.negator) for u in frame.units],
+            'references':list(frame.unresolved_references),'alternatives':alternatives,'unresolved':unresolved,
+            'nominal_fragments':nominal_fragments,'constituent_contrasts':constituent_contrasts,
+            'meaning_operator_bindings':meaning_operator_bindings,
+            'meaning_property_bindings':meaning_property_bindings,'meaning_relation_bindings':meaning_relation_bindings,
+            'semantic_status':'NOT_EVALUATED',
+            'status':'PARTIAL' if frame.closure_blockers or unresolved or any(a['status']=='INCOMPATIBLE' for a in agreements) else 'STRUCTURALLY_ANALYZED',
+            'provenance':{'parser':'builtin_french_grammar_v0','projection':'existing_tokens_clauses_arguments',
+                          'source_sha256':hashlib.sha256(frame.raw.encode('utf-8')).hexdigest(),'corpus':identity},
+            'boundary':{'readonly':True,'decision_authority':'KX108_ONLY','memory_write':False,
+                        'verified_fact':False,'execution_authorized':False,'semantic_resolution':False}}
+
