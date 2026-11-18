@@ -140,6 +140,9 @@ class SenseDefinition:
     synonyms: list[str] = field(default_factory=list)
     antonyms: list[str] = field(default_factory=list)
     source_id: str = ""
+    kind: str = "definition"
+    gloss: str = ""
+    verified_fact: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -151,6 +154,9 @@ class SenseDefinition:
             "synonyms": list(self.synonyms),
             "antonyms": list(self.antonyms),
             "source_id": self.source_id,
+            "kind": self.kind,
+            "gloss": self.gloss,
+            "verified_fact": self.verified_fact,
         }
 
 
