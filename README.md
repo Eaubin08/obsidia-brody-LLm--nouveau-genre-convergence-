@@ -544,4 +544,4 @@ Le projet n'est pas terminé parce que des modules réussissent des tests. Il pr
 
 — **Etienne Aubin**, fondateur d'Obsidia et concepteur de Brody
 
-*Document fondateur — proposition V3 soumise à validation humaine. Aucune publication ni modification du dépôt distant n'est impliquée par cette rédaction.*
+*Document fondateur V3 — publié comme présentation du projet. Les capacités et les preuves techniques restent soumises à une validation distincte ; ce texte ne certifie pas une convergence complète.*
