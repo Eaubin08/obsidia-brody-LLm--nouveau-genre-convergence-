@@ -80,6 +80,7 @@ from brody.composition import (
     build_governed_e11_envelope,
     consume_envelope,
 )
+from brody.cognition import run_cognitive_pipeline
 
 
 class BrodyDialogueSession:
@@ -110,6 +111,29 @@ class BrodyDialogueSession:
             provenance=("multi_turn_history",),
         )
         self.registry.register(turn_entry)
+
+        # Enregistrement des signaux cognitifs P1 dans le registre B6
+        if isinstance(turn.structured_payload, dict) and "cognitive_packet" in turn.structured_payload:
+            cog = turn.structured_payload["cognitive_packet"]
+            cog_entry = StateEntry(
+                state_id=f"turn_{turn.turn_index}_cognition",
+                state_type="cognitive_signals",
+                source_ref="brody://cognition/tree_signals",
+                payload={
+                    "dominant_trees": cog.get("dominant_trees", []),
+                    "patterns_detected": cog.get("patterns_detected", []),
+                    "active_layers": cog.get("active_layers", []),
+                    "forbidden_layers": cog.get("forbidden_layers", []),
+                    "bio_animal": cog.get("bio_animal_signal", {}),
+                    "weak_signals": cog.get("weak_signals", []),
+                    "dead_paths": cog.get("dead_paths", []),
+                },
+                summary=f"Signaux cognitifs P1 du tour {turn.turn_index}",
+                status=StateStatus.KNOWN,
+                visibility=Visibility.FULL,
+                provenance=("p1_cognitive_pipeline",),
+            )
+            self.registry.register(cog_entry)
 
     def get_snapshot(self) -> DialogueSessionSnapshot:
         snapshot = DialogueSessionSnapshot(
@@ -153,6 +177,20 @@ class BrodyConversationalPipeline:
 
         invoked_modules: list[str] = ["brody.orchestration.router_core"]
 
+        # 0. Exécution du sous-système cognitif unifié (Phase P1 : 34 Arbres, Shazam, 21D, Micro-Core)
+        cognitive_packet = run_cognitive_pipeline(
+            raw_query,
+            session_id=active_session.session_id,
+            language=language,
+        )
+        invoked_modules.extend([
+            "brody.cognition.micro_core",
+            "brody.cognition.balance_engine",
+            "brody.cognition.point_cloud_21d",
+            "brody.cognition.shazam",
+            "brody.cognition.trees",
+        ])
+
         # 1. Décision de routage pré-inférence (Lot 7)
         decision = self.router.decide_route(raw_query)
 
@@ -179,7 +217,7 @@ class BrodyConversationalPipeline:
                 is_native_correct=False,
                 is_qwen_recourse=False,
                 is_justified_refusal=True,
-                structured_payload={"reason": decision.gate_reason},
+                structured_payload={"reason": decision.gate_reason, "cognitive_packet": cognitive_packet},
                 receipt=receipt,
             )
             active_session.add_turn(turn)
@@ -208,7 +246,7 @@ class BrodyConversationalPipeline:
                 is_native_correct=True,
                 is_qwen_recourse=False,
                 is_justified_refusal=True,
-                structured_payload={"reason": decision.gate_reason},
+                structured_payload={"reason": decision.gate_reason, "cognitive_packet": cognitive_packet},
                 receipt=receipt,
             )
             active_session.add_turn(turn)
@@ -237,7 +275,7 @@ class BrodyConversationalPipeline:
                 is_native_correct=False,
                 is_qwen_recourse=False,
                 is_justified_refusal=True,
-                structured_payload={"reason": decision.gate_reason},
+                structured_payload={"reason": decision.gate_reason, "cognitive_packet": cognitive_packet},
                 receipt=receipt,
             )
             active_session.add_turn(turn)
@@ -257,6 +295,8 @@ class BrodyConversationalPipeline:
                 qwen_fallback_used=False,
                 execution_time_ms=round((time.perf_counter() - t_start) * 1000, 2),
             )
+            payload_4 = dict(arith_res.structured_payload) if isinstance(arith_res.structured_payload, dict) else {}
+            payload_4["cognitive_packet"] = cognitive_packet
             turn = TurnRecord(
                 turn_index=turn_idx,
                 query=raw_query,
@@ -267,7 +307,7 @@ class BrodyConversationalPipeline:
                 is_native_correct=True,
                 is_qwen_recourse=False,
                 is_justified_refusal=False,
-                structured_payload=arith_res.structured_payload,
+                structured_payload=payload_4,
                 receipt=receipt,
             )
             active_session.add_turn(turn)
@@ -309,6 +349,7 @@ class BrodyConversationalPipeline:
                     "composition": comp_res,
                     "envelope": env,
                     "consumption": consumed,
+                    "cognitive_packet": cognitive_packet,
                 },
                 receipt=receipt,
             )
@@ -351,7 +392,51 @@ class BrodyConversationalPipeline:
                 is_native_correct=True,
                 is_qwen_recourse=False,
                 is_justified_refusal=False,
-                structured_payload={"canonical_topic": decision.canonical_topic},
+                structured_payload={"canonical_topic": decision.canonical_topic, "cognitive_packet": cognitive_packet},
+                receipt=receipt,
+            )
+            active_session.add_turn(turn)
+            return turn
+
+        # ── CAS 6.1 : Sujet Canonique 34 Arbres / Shazam Cognitif (Phase P1) ──
+        if decision.canonical_topic == "34_ARBRES":
+            invoked_modules.extend([
+                "brody.cognition.shazam",
+                "brody.cognition.trees",
+            ])
+            dominant_names = cognitive_packet.get("dominant_trees") or ["Arbre de la Conscience"]
+            patterns = cognitive_packet.get("patterns_detected") or ["COGNITION_STABLE"]
+            answer = (
+                f"Analyse cognitive des 34 Arbres (Shazam Cognitif) :\n"
+                f"- Arbres dominants activés : {', '.join(dominant_names)}\n"
+                f"- Motifs cognitifs identifiés : {', '.join(patterns)}\n"
+                f"- Pertinence mémoire : {cognitive_packet.get('memory_relevance', 0.0)} | Pertinence monde : {cognitive_packet.get('world_relevance', 0.0)}\n"
+                f"- Couches actives 21D : {', '.join(cognitive_packet.get('active_layers', []))}\n"
+                f"- Cadre d'autorité : non-décisionnel, sous gouvernance stricte KX108."
+            )
+            receipt = RouteReceipt(
+                receipt_id=f"rcpt_{hashlib.md5(raw_query.encode()).hexdigest()[:8]}",
+                route_decision=decision,
+                timestamp=str(time.time()),
+                execution_status="SUCCESS",
+                native_modules_invoked=invoked_modules,
+                qwen_fallback_used=False,
+                execution_time_ms=round((time.perf_counter() - t_start) * 1000, 2),
+            )
+            turn = TurnRecord(
+                turn_index=turn_idx,
+                query=raw_query,
+                route_decision=decision,
+                answer_text=answer,
+                status=TURN_STATUS_SUCCESS,
+                native_modules_invoked=invoked_modules,
+                is_native_correct=True,
+                is_qwen_recourse=False,
+                is_justified_refusal=False,
+                structured_payload={
+                    "canonical_topic": "34_ARBRES",
+                    "cognitive_packet": cognitive_packet,
+                },
                 receipt=receipt,
             )
             active_session.add_turn(turn)
@@ -442,6 +527,7 @@ class BrodyConversationalPipeline:
                 structured_payload={
                     "conclusions": [c.to_dict() for c in conclusions],
                     "contradictions": contradictions_list,
+                    "cognitive_packet": cognitive_packet,
                 },
                 receipt=receipt,
             )
@@ -514,7 +600,7 @@ class BrodyConversationalPipeline:
                 is_native_correct=True,
                 is_qwen_recourse=False,
                 is_justified_refusal=True,
-                structured_payload={"sufficiency": sufficiency},
+                structured_payload={"sufficiency": sufficiency, "cognitive_packet": cognitive_packet},
                 receipt=receipt,
             )
             active_session.add_turn(turn)
@@ -572,6 +658,7 @@ class BrodyConversationalPipeline:
                 "conclusions": [c.to_dict() for c in conclusions],
                 "restitution": restitution,
                 "memory_item": selected_item,
+                "cognitive_packet": cognitive_packet,
             },
             receipt=receipt,
         )
